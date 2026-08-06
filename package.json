@@ -1,0 +1,23 @@
+{
+  "name": "g4skins-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node src/index.js"
+  },
+  "dependencies": {
+    "@sparticuz/chromium": "^129.0.0",
+    "dotenv": "^16.x.x",
+    "express": "^4.22.1",
+    "mongoose": "^8.0.0",
+    "puppeteer": "^21.11.0",
+    "puppeteer-core": "^23.0.0",
+    "puppeteer-extra": "^3.x.x",
+    "puppeteer-extra-plugin-stealth": "^2.x.x",
+    "telegraf": "^4.x.x"
+  },
+  "engines": {
+    "node": "18.0.0"
+  }
+}
