@@ -1,0 +1,18 @@
+# Pakiety i logi
+node_modules/
+*.log
+npm-debug.log*
+
+# Zmienne środowiskowe
+.env
+.env.*
+
+# Lokalny zapis sesji/danych (jeśli używasz tymczasowo plików JSON)
+sessions.json
+users.json
+
+# Pliki systemowe i edytorów
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
