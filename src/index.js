@@ -1215,7 +1215,7 @@ async function waitForRedirectOrGuard(ctx, page, userId) {
 
 async function checkDailyCase(ctx) {
   const userId = ctx.from.id.toString();
-  const session = activeSessions.get(userId);
+  let session = activeSessions.get(userId);
 
   // Sprawdź czy użytkownik ma zapisane dane Steam
   const user = await loadUser(userId);
@@ -1229,10 +1229,20 @@ async function checkDailyCase(ctx) {
       if (!loginSuccess) {
         return null;
       }
+      // Pobierz sesję ponownie po zalogowaniu
+      session = activeSessions.get(userId);
     } else {
       await ctx.reply('❌ Nie jesteś zalogowany! Użyj /login lub najpierw zapisz dane Steam komendą /setsteam');
       return null;
     }
+  }
+
+  // Sprawdź czy sesja ma wymagane właściwości
+  if (!session || !session.page || !session.browser) {
+    logger.error(`❌ [${userId}] Sesja nie ma wymaganych właściwości (page/browser)`);
+    await ctx.reply('❌ Błąd sesji! Spróbuj zalogować się ponownie /login');
+    activeSessions.delete(userId);
+    return null;
   }
 
   const { page, browser } = session;
@@ -1334,7 +1344,7 @@ async function checkDailyCase(ctx) {
 
 async function openDailyCase(ctx) {
   const userId = ctx.from.id.toString();
-  const session = activeSessions.get(userId);
+  let session = activeSessions.get(userId);
 
   // Sprawdź czy użytkownik ma zapisane dane Steam
   const user = await loadUser(userId);
@@ -1348,10 +1358,20 @@ async function openDailyCase(ctx) {
       if (!loginSuccess) {
         return false;
       }
+      // Pobierz sesję ponownie po zalogowaniu
+      session = activeSessions.get(userId);
     } else {
       await ctx.reply('❌ Nie jesteś zalogowany! Użyj /login lub najpierw zapisz dane Steam komendą /setsteam');
       return false;
     }
+  }
+
+  // Sprawdź czy sesja ma wymagane właściwości
+  if (!session || !session.page || !session.browser) {
+    logger.error(`❌ [${userId}] Sesja nie ma wymaganych właściwości (page/browser)`);
+    await ctx.reply('❌ Błąd sesji! Spróbuj zalogować się ponownie /login');
+    activeSessions.delete(userId);
+    return false;
   }
 
   const { page, browser } = session;
@@ -1368,8 +1388,8 @@ async function openDailyCase(ctx) {
 
     await ctx.reply('📦 Sprawdzam ekwipunek przed otwarciem...');
 
-    const inventoryBefore = await page.evaluate(async () => {
-      const response = await fetch(CONFIG.URLS.G4SKINS_API_INVENTORY, {
+    const inventoryBefore = await page.evaluate(async (apiUrl) => {
+      const response = await fetch(apiUrl, {
         method: 'GET',
         credentials: 'include'
       });
@@ -1379,7 +1399,7 @@ async function openDailyCase(ctx) {
         name: item.name,
         value: item.value
       }));
-    });
+    }, CONFIG.URLS.G4SKINS_API_INVENTORY);
 
     logger.info(`📦 [${userId}] Ekwipunek przed: ${inventoryBefore.length} itemów`);
 
@@ -1438,8 +1458,8 @@ async function openDailyCase(ctx) {
 
     await new Promise(resolve => setTimeout(resolve, 3000));
 
-    const inventoryAfter = await page.evaluate(async () => {
-      const response = await fetch(CONFIG.URLS.G4SKINS_API_INVENTORY, {
+    const inventoryAfter = await page.evaluate(async (apiUrl) => {
+      const response = await fetch(apiUrl, {
         method: 'GET',
         credentials: 'include'
       });
@@ -1449,7 +1469,7 @@ async function openDailyCase(ctx) {
         name: item.name,
         value: item.value
       }));
-    });
+    }, CONFIG.URLS.G4SKINS_API_INVENTORY);
 
     logger.info(`📦 [${userId}] Ekwipunek po: ${inventoryAfter.length} itemów`);
 
@@ -2079,6 +2099,24 @@ async function startBot() {
     await bot.launch();
     logger.info('✅ Bot uruchomiony pomyślnie!');
     logger.info('🎯 Bot gotowy do pracy - wyślij /start w Telegramie');
+
+    // 3. Uruchom konsolę komend do testowania (tylko w trybie dev)
+    if (!isProduction) {
+      const ConsoleCommands = require('./console-commands');
+      const consoleCmd = new ConsoleCommands(
+        bot,
+        activeSessions,
+        loadUser,
+        loginToSteam,
+        checkDailyCase,
+        openDailyCase
+      );
+
+      // Dodaj małe opóźnienie żeby logi startowe się wyświetliły przed promptem
+      setTimeout(() => {
+        consoleCmd.start();
+      }, 500);
+    }
   } catch (err) {
     logger.error('❌ Błąd uruchamiania bota:', err);
     process.exit(1);
