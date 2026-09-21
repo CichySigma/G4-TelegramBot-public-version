@@ -436,6 +436,7 @@ async function loginToSteam(ctx, loginMethod = 'password') {
 
         if (stillLoggedIn) {
           logger.info(`✅ [${userId}] Zalogowano automatycznie z cookies`);
+          ctx.reply(`Zalogowano automatycznie z cookies`);
           session = session || {};
           session.browser = browser;
           session.page = page;
