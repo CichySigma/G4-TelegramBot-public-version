@@ -25,6 +25,7 @@ const path = require('path');
 const fs = require('fs');
 const puppeteerCore = require('puppeteer-core');
 const chromium = require('@sparticuz/chromium');
+const logger = require('./logger');
 
 puppeteer.use(StealthPlugin());
 
@@ -48,13 +49,6 @@ const getPuppeteerConfig = async () => {
       args: ['--no-sandbox']
     };
   }
-};
-
-// Logger
-const logger = {
-  info: (...args) => console.log(new Date().toISOString(), '[INFO]', ...args),
-  error: (...args) => console.error(new Date().toISOString(), '[ERROR]', ...args),
-  warn: (...args) => console.warn(new Date().toISOString(), '[WARN]', ...args)
 };
 
 // Debug
@@ -120,49 +114,37 @@ const CONFIG = {
   }
 };
 
-// Struktura: { telegramId: { browser, page, username, loginMethod, isLoggedIn, autoOpenTimeout } }
+// Struktura: { telegramId: { browser, page, username, loginMethod, isLoggedIn, autoOpenTimeout, autoOpenEnabled, nextCaseTime } }
 const activeSessions = new Map();
 const sessionCreationTime = new Map();
 const autoOpenLocks = new Map();
 
-// ====== AUTO-CLEANUP STARYCH SESJI ======
+// Śledzenie ostatnich logów watchdog (żeby logować co ~10 min w tle)
+const lastWatchdogLogTime = new Map();
+
+// ====== AUTO-CLEANUP STARYCH SESJI (oszczędzanie RAM) ======
 async function cleanupIdleSessions() {
   const now = Date.now();
   const sessionsToDelete = [];
 
-  // OCHRONA: Jeśli przekroczono limit sesji, usuń najstarsze
-  if (activeSessions.size > CONFIG.MAX_ACTIVE_SESSIONS) {
-    logger.warn(`⚠️ Przekroczono limit sesji (${activeSessions.size}/${CONFIG.MAX_ACTIVE_SESSIONS}), czyszczę najstarsze...`);
-
-    const sortedByAge = Array.from(activeSessions.keys())
-      .map(userId => ({ userId, createdTime: sessionCreationTime.get(userId) || 0 }))
-      .sort((a, b) => a.createdTime - b.createdTime);
-
-    const toRemove = activeSessions.size - CONFIG.MAX_ACTIVE_SESSIONS;
-    for (let i = 0; i < toRemove; i++) {
-      const { userId } = sortedByAge[i];
-      const session = activeSessions.get(userId);
-
-      if (!session?.autoOpenTimeout) {
-        sessionsToDelete.push(userId);
-      }
-    }
-  }
-
-  // Normalne czyszczenie idle sesji
   for (const [userId, session] of activeSessions.entries()) {
     const createdTime = sessionCreationTime.get(userId) || 0;
     const idleTime = now - createdTime;
 
-    if (session.autoOpenTimeout) {
-      // Jeśli sesja ma aktywny AutoOpen, ale przeglądarka 'wisi' nieaktywna zbyt długo – zamknij ją (oszczędność RAM)
+    // Sprawdź czy użytkownik ma włączony AutoOpen
+    const isAutoOpen = session?.autoOpenEnabled || session?.autoOpenTimeout;
+
+    if (isAutoOpen) {
+      // Jeśli sesja ma aktywny AutoOpen, ale przeglądarka 'wisi' bezczynna – zamknij ją dla RAM
       if (session.browser && idleTime > CONFIG.SESSION_IDLE_TIMEOUT) {
-        logger.info(`🧹 [${userId}] Zamykam przeglądarkę oczekującą na AutoOpen (oszczędzanie RAM)`);
-        try { await session.browser.close(); } catch(e) {}
+        logger.info(`🧹 [${userId}] Zamykam bezczynną przeglądarkę oczekującą na AutoOpen (oszczędzanie RAM)`);
+        try {
+          await session.browser.close();
+        } catch (e) {}
         session.browser = null;
         session.page = null;
       }
-      continue;
+      continue; // Nie usuwaj wpisu sesji dla AutoOpen!
     }
 
     if (idleTime > CONFIG.SESSION_IDLE_TIMEOUT) {
@@ -171,7 +153,7 @@ async function cleanupIdleSessions() {
     }
   }
 
-  // Zamknij i usuń sesje
+  // Zamknij i usuń nieużywane sesje
   for (const userId of sessionsToDelete) {
     const session = activeSessions.get(userId);
     if (session?.browser) {
@@ -185,10 +167,11 @@ async function cleanupIdleSessions() {
     activeSessions.delete(userId);
     sessionCreationTime.delete(userId);
     autoOpenLocks.delete(userId);
+    lastWatchdogLogTime.delete(userId);
   }
 
   if (activeSessions.size > 0) {
-    logger.info(`💾 RAM: ${activeSessions.size} aktywnych sesji`);
+    logger.info(`💾 RAM: ${activeSessions.size} zarejestrowanych sesji w pamięci`);
   }
 }
 
@@ -201,7 +184,59 @@ function setSessionAndTrack(userId, session) {
   activeSessions.set(userId, session);
 }
 
-// ====== FUNKCJE POMOCNICZE ======
+// ====== FUNKCJE POMOCNICZE CZASU I BAZY ======
+
+/**
+ * Precyzyjne parsowanie stringa czasu do milisekund
+ * Obsługuje formaty:
+ * - "19 h  42 m  06s", "19h 42m 06s", "42m 06s", "45s"
+ * - "19:42:06", "05:30", "15"
+ * - "19 godz 42 min 06 sek"
+ */
+function parseTimeToMs(timeStr) {
+  if (!timeStr || typeof timeStr !== 'string') return 5 * 60 * 1000;
+
+  const clean = timeStr.trim().toLowerCase();
+
+  const hMatch = clean.match(/(\d+)\s*(?:h|godz)/);
+  const mMatch = clean.match(/(\d+)\s*(?:m|min)/);
+  const sMatch = clean.match(/(\d+)\s*(?:s|sek)/);
+
+  if (hMatch || mMatch || sMatch) {
+    const h = hMatch ? parseInt(hMatch[1], 10) : 0;
+    const m = mMatch ? parseInt(mMatch[1], 10) : 0;
+    const s = sMatch ? parseInt(sMatch[1], 10) : 0;
+    const totalMs = (h * 3600 + m * 60 + s) * 1000;
+    if (totalMs > 0) return totalMs;
+  }
+
+  const colonParts = clean.split(':').map(p => parseInt(p.trim(), 10)).filter(n => !isNaN(n));
+  if (colonParts.length === 3) {
+    return (colonParts[0] * 3600 + colonParts[1] * 60 + colonParts[2]) * 1000;
+  } else if (colonParts.length === 2) {
+    return (colonParts[0] * 60 + colonParts[1]) * 1000;
+  } else if (colonParts.length === 1 && colonParts[0] > 0) {
+    return colonParts[0] * 1000;
+  }
+
+  return 5 * 60 * 1000; // Fallback: 5 min
+}
+
+/**
+ * Formatuje ms do czytelnego ciągu np. "19h 42m 06s"
+ */
+function formatTimeMs(ms) {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = totalSeconds % 60;
+
+  const parts = [];
+  if (h > 0) parts.push(`${h}h`);
+  if (m > 0 || h > 0) parts.push(`${m}m`);
+  parts.push(`${s.toString().padStart(2, '0')}s`);
+  return parts.join(' ');
+}
 
 async function loadUser(userId) {
   try {
@@ -211,16 +246,6 @@ async function loadUser(userId) {
     }
 
     const user = await User.findOne({ telegramId: userId });
-
-    if (user) {
-      logger.info(`✅ Znaleziono użytkownika ${userId}:`, {
-        username: user.steamUsername ? 'TAK' : 'NIE',
-        pin: user.familyViewPin ? 'TAK' : 'NIE'
-      });
-    } else {
-      logger.info(`ℹ️ Użytkownik ${userId} nie istnieje w bazie`);
-    }
-
     return user;
   } catch (error) {
     logger.error('❌ Błąd ładowania użytkownika:', error.message);
@@ -270,7 +295,7 @@ async function loadSessionCookies(userId) {
 async function saveSessionCookies(userId, cookies) {
   try {
     await Session.findOneAndUpdate({ telegramId: userId }, { cookies }, { upsert: true });
-    logger.info(`💾 [${userId}] Cookies zapisane`);
+    logger.info(`💾 [${userId}] Cookies zapisane w bazie`);
   } catch (error) {
     logger.error('❌ Błąd zapisywania cookies:', error.message);
   }
@@ -349,14 +374,14 @@ async function findButtonByText(page, text, timeout = 10000) {
   }
 }
 
-// ====== LOGOWANIE ======
+// ====== STEAM LOGIN FLOW ======
 
 async function loginToSteam(ctx, loginMethod = 'password') {
   const userId = ctx.from.id.toString();
   let session = activeSessions.get(userId);
 
   try {
-    if (!session || !session.browser) {
+    if (!session || !session.browser || !session.browser.isConnected()) {
       const config = await getPuppeteerConfig();
       let browser;
 
@@ -385,13 +410,13 @@ async function loginToSteam(ctx, loginMethod = 'password') {
 
       const page = await browser.newPage();
 
+      // Monitoruj crash / zamknięcie przeglądarki BEZ resetowania isLoggedIn
       browser.on('disconnected', () => {
-        logger.warn(`⚠️ [${userId}] Przeglądarka odłączona (crash lub zamknięcie)`);
+        logger.warn(`⚠️ [${userId}] Przeglądarka odłączona (zamknięcie/crash)`);
         const currentSession = activeSessions.get(userId);
         if (currentSession) {
           currentSession.browser = null;
           currentSession.page = null;
-          currentSession.isLoggedIn = false;
           setSessionAndTrack(userId, currentSession);
         }
       });
@@ -400,54 +425,57 @@ async function loginToSteam(ctx, loginMethod = 'password') {
       await page.setViewport({ width: 1366, height: 768 });
 
       const savedCookies = await loadSessionCookies(userId);
-      if (savedCookies && Array.isArray(savedCookies)) {
+      if (savedCookies && Array.isArray(savedCookies) && savedCookies.length > 0) {
         const cleanedCookies = savedCookies.map(({ partitionKey, ...rest }) => rest);
         await page.setCookie(...cleanedCookies);
-        await page.goto(CONFIG.URLS.G4SKINS_DAILY, { waitUntil: 'networkidle2' });
+        await page.goto(CONFIG.URLS.G4SKINS_DAILY, { waitUntil: 'networkidle2' }).catch(() => {});
 
         const stillLoggedIn = await page.evaluate(() => {
           return !document.querySelector('.login-form-content');
-        });
+        }).catch(() => false);
 
         if (stillLoggedIn) {
           logger.info(`✅ [${userId}] Zalogowano automatycznie z cookies`);
-          setSessionAndTrack(userId, { browser, page, isLoggedIn: true, loginMethod });
-          await ctx.reply('✅ Zalogowano automatycznie z zapisanej sesji!');
+          session = session || {};
+          session.browser = browser;
+          session.page = page;
+          session.isLoggedIn = true;
+          session.loginMethod = loginMethod;
+          setSessionAndTrack(userId, session);
           return true;
         }
       }
 
-      session = { browser, page, isLoggedIn: false, loginMethod };
+      session = session || {};
+      session.browser = browser;
+      session.page = page;
+      session.isLoggedIn = false;
+      session.loginMethod = loginMethod;
       setSessionAndTrack(userId, session);
     }
 
     const { page } = session;
 
-    await ctx.reply('🔄 Rozpoczynam logowanie...');
-    await page.goto('https://g4skins.com/daily-case/open', { waitUntil: 'networkidle2' });
+    if (!ctx.isSilent) await ctx.reply('🔄 Rozpoczynam logowanie...');
+    await page.goto(CONFIG.URLS.G4SKINS_DAILY, { waitUntil: 'networkidle2' });
 
     try {
       await page.waitForSelector(SELECTORS.g4skins.loginForm, { timeout: 10000 });
     } catch (e) {
-      await ctx.reply('⚠️ Nie znaleziono formularza logowania, klikam przycisk login...');
-      try {
-        await page.click('button[class*="login"], .login-button');
-      } catch (e2) {
-        logger.warn(`⚠️ [${userId}] Standardowy przycisk nie działa, próbuję znaleźć link login...`);
-        const loginElement = await page.evaluateHandle(() => {
-          const elements = Array.from(document.querySelectorAll('a, button, input[type="button"], input[type="submit"]'));
-          return elements.find(el => el.textContent && el.textContent.toLowerCase().includes('login'));
-        });
-        if (loginElement) {
-          await loginElement.click();
-        } else {
-          throw new Error('Nie znaleziono żadnego elementu logowania');
-        }
+      const alreadyLoggedIn = await page.evaluate(() => {
+        return !document.querySelector('.login-form-content');
+      });
+
+      if (alreadyLoggedIn) {
+        if (!ctx.isSilent) await ctx.reply('✅ Już jesteś zalogowany!');
+        session.isLoggedIn = true;
+        setSessionAndTrack(userId, session);
+        return true;
       }
       await new Promise(resolve => setTimeout(resolve, 2000));
     }
 
-    await ctx.reply('☑️ Zaznaczam checkboxy...');
+    if (!ctx.isSilent) await ctx.reply('☑️ Zaznaczam checkboxy...');
 
     await page.waitForSelector(SELECTORS.g4skins.checkbox, { timeout: 5000 }).catch(() => {});
     await new Promise(resolve => setTimeout(resolve, 1500));
@@ -459,10 +487,7 @@ async function loginToSteam(ctx, loginMethod = 'password') {
       try {
         await checkboxes[i].click();
         clickedCount++;
-        console.log(`[DEBUG] Checkbox ${i} kliknięty natywnie.`);
       } catch (err) {
-        console.log(`[DEBUG] Błąd natywnego kliknięcia checkboxa ${i}, próbuję kliknąć rodzica (wrapper)...`);
-
         await page.evaluate((el) => {
           if (el.labels && el.labels.length > 0) {
             el.labels[0].click();
@@ -472,30 +497,15 @@ async function loginToSteam(ctx, loginMethod = 'password') {
             el.click();
           }
         }, checkboxes[i]);
-
         clickedCount++;
       }
-
       await new Promise(resolve => setTimeout(resolve, 500));
     }
 
-    logger.info(`[DEBUG] Znaleziono checkboxów: ${checkboxes.length}, Kliknięto pomyślnie: ${clickedCount}`);
-    await ctx.reply(`☑️ Zaznaczono checkboxy: ${clickedCount}/${checkboxes.length}`);
-
+    logger.info(`[${userId}] Checkboxy kliknięte: ${clickedCount}/${checkboxes.length}`);
     await new Promise(resolve => setTimeout(resolve, 2000));
 
-    await ctx.reply('🎮 Przechodzę do Steam...');
-
-    const steamButtonDebug = await page.evaluate(() => {
-      const buttons = document.querySelectorAll('.login-form-content-nav button, .login-form-content button');
-      return Array.from(buttons).map((btn, i) => ({
-        index: i,
-        text: btn.textContent?.trim(),
-        disabled: btn.disabled || btn.hasAttribute('disabled'),
-        classes: btn.className
-      }));
-    });
-    logger.info(`[DEBUG] Dostępne przyciski Steam: ${JSON.stringify(steamButtonDebug)}`);
+    if (!ctx.isSilent) await ctx.reply('🎮 Przechodzę do Steam...');
 
     await page.waitForFunction(
       () => {
@@ -511,7 +521,6 @@ async function loginToSteam(ctx, loginMethod = 'password') {
                   document.querySelector('.login-form-content-nav-login:not([disabled])');
       if (btn) {
         btn.click();
-        console.log('[DEBUG] Kliknięto przycisk Steam');
       }
     });
 
@@ -529,12 +538,12 @@ async function loginToSteam(ctx, loginMethod = 'password') {
       await handlePasswordLogin(ctx, page, userId);
     }
 
-    logger.info(`✅ [${userId}] Logowanie zakończone, przeglądarka pozostaje otwarta`);
+    logger.info(`✅ [${userId}] Logowanie Steam zakończone pomyślnie`);
     return true;
 
   } catch (error) {
     logger.error(`❌ [${userId}] Błąd logowania:`, error.message);
-    await ctx.reply(`❌ Błąd logowania: ${error.message}`);
+    if (!ctx.isSilent) await ctx.reply(`❌ Błąd logowania: ${error.message}`);
     return false;
   }
 }
@@ -543,36 +552,28 @@ async function handlePasswordLogin(ctx, page, userId) {
   const user = await loadUser(userId);
 
   if (!user || !user.steamUsername || !user.steamPassword) {
-    await ctx.reply('❌ Nie masz zapisanych danych Steam! Użyj /setsteam');
+    if (!ctx.isSilent) await ctx.reply('❌ Nie masz zapisanych danych Steam! Użyj /setsteam');
     throw new Error('Brak danych Steam');
   }
 
-  await ctx.reply('🔐 Wypełniam dane logowania...');
+  if (!ctx.isSilent) await ctx.reply('🔑 Wpisuję dane logowania...');
 
-  const usernameSelector = await findElement(page, SELECTORS.steam.usernameInput, 10000);
-  await page.type(usernameSelector, user.steamUsername);
-  await new Promise(resolve => setTimeout(resolve, 500));
+  const usernameSelector = await findElement(page, SELECTORS.steam.usernameInput);
+  await page.click(usernameSelector);
+  await page.keyboard.type(user.steamUsername);
 
-  const passwordSelector = await findElement(page, SELECTORS.steam.passwordInput, 10000);
-  await page.type(passwordSelector, user.steamPassword);
-  await new Promise(resolve => setTimeout(resolve, 500));
+  const passwordSelector = await findElement(page, SELECTORS.steam.passwordInput);
+  await page.click(passwordSelector);
+  await page.keyboard.type(user.steamPassword);
 
-  await ctx.reply('✅ Dane wprowadzone, klikam "Sign in"...');
+  const submitSelector = await findElement(page, SELECTORS.steam.submitButton);
+  await page.click(submitSelector);
 
-  try {
-    const submitSelector = await findElement(page, SELECTORS.steam.submitButton, 5000);
-    await page.click(submitSelector);
-  } catch (e) {
-    logger.warn(`⚠️ [${userId}] Standardowe selektory nie działają, próbuję znaleźć przycisk po tekście...`);
-    const loginButton = await findButtonByText(page, 'Sign in', 5000);
-    await loginButton.click();
-  }
-
-  await ctx.reply('⏳ Czekam na odpowiedź Steam...');
+  await waitForRedirectOrGuard(ctx, page, userId);
 }
 
 async function handleQRLogin(ctx, page, userId) {
-  await ctx.reply('📱 Tryb logowania QR - czekam na kod...');
+  if (!ctx.isSilent) await ctx.reply('📱 Tryb logowania QR - czekam na kod...');
 
   let lastQRSrc = null;
   let qrSendTimeout = null;
@@ -601,17 +602,10 @@ async function handleQRLogin(ctx, page, userId) {
       const observer = new MutationObserver((mutations) => {
         mutations.forEach((mutation) => {
           if (mutation.type === 'attributes' && mutation.attributeName === 'src') {
-            const img = mutation.target;
-            if (img.src && img.src.startsWith('blob:')) {
-              window.onQRChange(img.src);
+            const target = mutation.target;
+            if (target.tagName === 'IMG' && target.src && target.src.startsWith('blob:')) {
+              window.onQRChange(target.src);
             }
-          }
-          if (mutation.type === 'childList') {
-            mutation.addedNodes.forEach((node) => {
-              if (node.tagName === 'IMG' && node.src && node.src.startsWith('blob:')) {
-                window.onQRChange(node.src);
-              }
-            });
           }
         });
       });
@@ -640,7 +634,7 @@ async function handleQRLogin(ctx, page, userId) {
 async function sendQRCode(ctx, blobUrl, userId, page) {
   const session = activeSessions.get(userId);
   if (!session) {
-    logger.warn(`⚠️ [${userId}] Sesja nie znaleziona`);
+    logger.warn(`⚠️ [${userId}] Sesja nie znaleziona przy QR`);
     return;
   }
 
@@ -652,19 +646,10 @@ async function sendQRCode(ctx, blobUrl, userId, page) {
         try {
           const response = await fetch(url);
           if (!response.ok) return null;
-
           const blob = await response.blob();
-
           return new Promise((resolve) => {
             const reader = new FileReader();
-            reader.onloadend = () => {
-              const result = reader.result;
-              if (result && typeof result === 'string') {
-                resolve(result);
-              } else {
-                resolve(null);
-              }
-            };
+            reader.onloadend = () => resolve(reader.result);
             reader.onerror = () => resolve(null);
             reader.readAsDataURL(blob);
           });
@@ -672,10 +657,9 @@ async function sendQRCode(ctx, blobUrl, userId, page) {
           return null;
         }
       }, blobUrl);
-
       base64 = base64Result;
     } catch (e) {
-      logger.warn(`⚠️ [${userId}] Metoda fetch nie zadziałała:`, e.message);
+      logger.warn(`⚠️ [${userId}] Metoda fetch QR nie zadziałała:`, e.message);
     }
 
     if (!base64) {
@@ -684,7 +668,6 @@ async function sendQRCode(ctx, blobUrl, userId, page) {
           try {
             const img = new Image();
             img.crossOrigin = 'anonymous';
-
             return new Promise((resolve) => {
               img.onload = () => {
                 const canvas = document.createElement('canvas');
@@ -702,56 +685,47 @@ async function sendQRCode(ctx, blobUrl, userId, page) {
           }
         }, blobUrl);
       } catch (e) {
-        logger.warn(`⚠️ [${userId}] Metoda canvas nie zadziałała:`, e.message);
+        logger.warn(`⚠️ [${userId}] Metoda canvas QR nie zadziałała:`, e.message);
       }
     }
 
     if (!base64) {
       logger.warn(`⚠️ [${userId}] Nie udało się skonwertować QR`);
-      await ctx.reply('📱 Nie mogę wyświetlić QR kodu, ale jest on otwarty w przeglądarce.\nZeskanuj kod w aplikacji Steam Mobile.');
+      if (!ctx.isSilent) await ctx.reply('📱 Nie mogę wyświetlić QR kodu - zeskanuj kod w aplikacji Steam Mobile.');
       return;
     }
 
     const base64Data = base64.split(',')[1];
-    if (!base64Data) {
-      throw new Error('Brak danych base64');
-    }
+    if (!base64Data) throw new Error('Brak danych base64');
 
     const buffer = Buffer.from(base64Data, 'base64');
-
-    await ctx.replyWithPhoto(
+    await bot.telegram.sendPhoto(
+      userId,
       { source: buffer },
-      {
-        caption: '📱 Zeskanuj ten kod w aplikacji Steam Mobile',
-        parse_mode: 'HTML'
-      }
+      { caption: '📱 Zeskanuj ten kod w aplikacji Steam Mobile', parse_mode: 'HTML' }
     );
 
     logger.info(`✅ [${userId}] QR kod wysłany`);
 
   } catch (error) {
     logger.error(`❌ [${userId}] Błąd wysyłania QR:`, error.message);
-    await ctx.reply('⚠️ Nie mogę wysłać QR kodu - sprawdź czy QR jest widoczny w przeglądarce.');
   }
 }
 
 async function handleFamilyView(ctx, page, userId) {
-  logger.info(`${userId}: Rozpoczynam obsługę Family View`);
-  await ctx.reply('🔄 Obsługuję Family View - sprawdzam PIN...');
-
   const user = await loadUser(userId);
+
   if (!user || !user.familyViewPin) {
-    await ctx.reply('⚠️ Nie masz zapisanego PIN-u Family View!\nUżyj komendy /setpin\nFormat: `PIN:1234`\n\nLub wpisz PIN ręcznie w przeglądarce.', { parse_mode: 'Markdown' });
-    logger.warn(`${userId}: Brak zapisanego PIN-u Family View`);
+    logger.warn(`[${userId}]: Brak zapisanego PIN-u Family View`);
     return false;
   }
 
   const pin = user.familyViewPin;
-  logger.info(`${userId}: Użyję PIN ${pin.replace(/./g, '*')}`);
+  logger.info(`[${userId}]: Użyję PIN ${pin.replace(/./g, '*')}`);
 
   for (let attempt = 1; attempt <= 3; attempt++) {
-    logger.info(`${userId}: Próba ${attempt}/3 obsługi Family View`);
-    await ctx.reply(`🔄 Próba ${attempt}/3 - odświeżam stronę...`);
+    logger.info(`[${userId}]: Próba ${attempt}/3 obsługi Family View`);
+    if (!ctx.isSilent) await ctx.reply(`🔄 Próba ${attempt}/3 - wpisuję PIN Family View...`);
 
     try {
       if (attempt > 1) {
@@ -767,110 +741,57 @@ async function handleFamilyView(ctx, page, userId) {
       });
 
       if (!familyViewExists) {
-        logger.info(`${userId}: Family View nie istnieje (już zniknął) - kontynuuję logowanie`);
-        await ctx.reply('✅ Family View nie jest już wymagany - kontynuuję logowanie!');
+        logger.info(`[${userId}]: Family View nie jest wymagany - kontynuuję`);
         return true;
       }
 
       await new Promise(resolve => setTimeout(resolve, 2000));
 
       let pinInput = null;
-
       try {
-        pinInput = await page.$('.\\32 YxW3WqLGy7hz21m6KbGD[type="password"]');
-        if (pinInput) logger.info(`${userId}: PIN input znaleziony metoda 1 (klasa)`);
-      } catch (e) { }
+        pinInput = await page.$('._2YxW3WqLGy7hz_21m6KbGD[type="password"]');
+      } catch (e) {}
 
       if (!pinInput) {
         pinInput = await page.$('input[type="password"]');
-        if (pinInput) logger.info(`${userId}: PIN input znaleziony metoda 2 (type)`);
       }
 
       if (!pinInput) {
         throw new Error('Nie znaleziono pola PIN');
       }
 
-      await ctx.reply('⌨️ Wpisuję PIN...');
-
       await pinInput.click();
       await new Promise(resolve => setTimeout(resolve, 300));
 
-      await page.evaluate((selector) => {
-        const input = document.querySelector(selector);
+      await page.evaluate(() => {
+        const input = document.querySelector('input[type="password"]');
         if (input) {
           input.value = '';
           input.focus();
         }
-      }, 'input[type="password"]');
+      });
 
       for (const digit of pin) {
         await page.keyboard.type(digit);
         await new Promise(resolve => setTimeout(resolve, 150));
       }
 
-      logger.info(`${userId}: PIN wpisany`);
-      await new Promise(resolve => setTimeout(resolve, 500));
-
       let okButton = null;
-
       try {
-        okButton = await page.$('button.\\32 KPv6oWB6ZxjWuqyNpedP');
-        if (okButton) logger.info(`${userId}: OK button znaleziony metoda 1`);
-      } catch (e) { }
+        okButton = await page.$('button._2KPv6oWB6ZxjWuqyNp_edP.DialogButton') || await page.$('button[type="submit"]');
+      } catch (e) {}
 
       if (!okButton) {
         okButton = await page.evaluateHandle(() => {
           const buttons = Array.from(document.querySelectorAll('button'));
           return buttons.find(btn => btn.textContent.trim() === 'OK');
         });
-        if (okButton) {
-          okButton = okButton.asElement();
-          if (okButton) {
-            logger.info(`${userId}: OK button znaleziony metoda 2 (text)`);
-          } else {
-            okButton = null;
-          }
-        }
+        if (okButton) okButton = okButton.asElement();
       }
 
-      if (!okButton) {
-        okButton = await page.$('button[type="submit"]');
-        if (okButton) logger.info(`${userId}: OK button znaleziony metoda 3 (submit)`);
-      }
-
-      if (!okButton) {
-        throw new Error('Nie znaleziono przycisku OK');
-      }
-
-      const isDisabled = await page.evaluate(btn => {
-        return btn.classList.contains('Disabled') || btn.disabled;
-      }, okButton);
-
-      if (isDisabled) {
-        logger.warn(`${userId}: Przycisk OK jest disabled, czekam...`);
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-
-      await ctx.reply('✔️ Klikam OK...');
-      await okButton.click();
-      logger.info(`${userId}: Przycisk OK kliknięty`);
-
-      await new Promise(resolve => setTimeout(resolve, 3000));
-
-      const hasError = await page.evaluate(() => {
-        const allText = document.body.innerText || document.body.textContent;
-        return allText.includes('correct PIN') || allText.includes('Nice try');
-      });
-
-      if (hasError) {
-        logger.error(`${userId}: Nieprawidłowy PIN Family View (próba ${attempt}/3)`);
-        if (attempt < 3) {
-          await ctx.reply(`❌ PIN nieprawidłowy (próba ${attempt}/3). Próbuję ponownie...`);
-          continue;
-        } else {
-          await ctx.reply('❌ PIN Family View jest nieprawidłowy po 3 próbach!\nZmień PIN komendą /setpin lub wpisz ręcznie.');
-          return false;
-        }
+      if (okButton) {
+        await okButton.click();
+        await new Promise(resolve => setTimeout(resolve, 3000));
       }
 
       const familyViewGone = await page.evaluate(() => {
@@ -879,31 +800,14 @@ async function handleFamilyView(ctx, page, userId) {
       });
 
       if (familyViewGone) {
-        logger.info(`${userId}: Family View pomyślnie pominięty w próbie ${attempt}`);
-        await ctx.reply('✅ Family View pominięty!');
+        logger.info(`✅ [${userId}]: Family View pomyślnie odblokowany!`);
         return true;
       }
 
-      logger.warn(`${userId}: Family View status niejasny w próbie ${attempt}, czekam...`);
       await new Promise(resolve => setTimeout(resolve, 2000));
 
-      if (attempt < 3) {
-        continue;
-      } else {
-        logger.error(`${userId}: Family View nie został pominięty po 3 próbach`);
-        await ctx.reply('❌ Nie udało się pominąć Family View po 3 próbach.');
-        return false;
-      }
-
     } catch (error) {
-      logger.error(`${userId}: Błąd w próbie ${attempt}:`, error.message);
-      if (attempt < 3) {
-        await ctx.reply(`⚠️ Błąd w próbie ${attempt}, próbuję ponownie...`);
-        continue;
-      } else {
-        await ctx.reply(`❌ Błąd po 3 próbach: ${error.message}`);
-        return false;
-      }
+      logger.error(`[${userId}]: Błąd Family View:`, error.message);
     }
   }
 
@@ -911,7 +815,7 @@ async function handleFamilyView(ctx, page, userId) {
 }
 
 async function waitForRedirectOrGuard(ctx, page, userId) {
-  await ctx.reply('⏳ Czekam na zalogowanie (max 2 minuty)...');
+  if (!ctx.isSilent) await ctx.reply('⏳ Czekam na zalogowanie (max 2 minuty)...');
 
   const maxWaitTime = 120000;
   const startTime = Date.now();
@@ -929,24 +833,13 @@ async function waitForRedirectOrGuard(ctx, page, userId) {
 
       const title = document.querySelector('div[class*="JEjgWHYD"], div[class*="B7Yoe"]');
       const hasFamilyTitle = title && title.textContent.includes('Family View');
-
       const isLoginPage = !window.location.href.includes('/openid/login');
 
       return {
         detected: (hasText && hasPinInput) || hasFamilyTitle || (hasError && hasPinInput) || hasResetLink,
-        isLoginPage,
-        debug: {
-          url: window.location.href,
-          hasText,
-          hasPinInput,
-          hasError,
-          hasFamilyTitle,
-          hasResetLink,
-          textSample: allText.substring(0, 300)
-        }
+        isLoginPage
       };
     });
-
     return familyViewDetection;
   };
 
@@ -957,29 +850,18 @@ async function waitForRedirectOrGuard(ctx, page, userId) {
       if (currentUrl.includes('steamcommunity.com') || currentUrl.includes('steampowered.com')) {
         const familyCheck = await checkForFamilyView();
 
-        logger.info(`🔍 [${userId}] Family View check:`, {
-          url: currentUrl,
-          detected: familyCheck.detected,
-          debug: familyCheck.debug
-        });
-
         if (familyCheck.detected) {
           familyViewAttempts++;
-          logger.info(`👨‍👩‍👧 [${userId}] ✅ WYKRYTO Family View! (próba ${familyViewAttempts}/3)`);
+          logger.info(`👨‍👩‍👧 [${userId}] Wykryto Family View (próba ${familyViewAttempts}/3)`);
 
           if (familyViewAttempts > 3) {
-            logger.warn(`⚠️ [${userId}] Przekroczono limit prób Family View, kończę logowanie`);
-            await ctx.reply('❌ Logowanie przerwane - zbyt wiele prób Family View.\n\nUstaw PIN komendą /setpin i spróbuj ponownie.');
+            if (!ctx.isSilent) await ctx.reply('❌ Logowanie przerwane - zbyt wiele prób Family View.');
             return false;
           }
 
-          await ctx.reply('👨‍👩‍👧 Wykryto Family View - wpisuję PIN...');
-
           const handled = await handleFamilyView(ctx, page, userId);
-
           if (!handled) {
-            await ctx.reply('❌ Logowanie przerwane z powodu Family View.\n\nUstaw PIN komendą /setpin i spróbuj ponownie zalogować się.');
-            logger.error(`❌ [${userId}] Logowanie przerwane - brak PIN-u Family View`);
+            if (!ctx.isSilent) await ctx.reply('❌ Nie udało się odblokować Family View. Sprawdź PIN (/setpin).');
             return false;
           }
 
@@ -989,12 +871,10 @@ async function waitForRedirectOrGuard(ctx, page, userId) {
       }
 
       if (currentUrl.includes('steamcommunity.com/openid/login')) {
-        logger.info(`${userId}: Wykryto stronę potwierdzenia OpenID`);
+        logger.info(`[${userId}]: Wykryto stronę potwierdzenia OpenID`);
 
         const familyCheckBeforeClick = await checkForFamilyView();
         if (familyCheckBeforeClick.detected) {
-          logger.info(`${userId}: Family View na stronie OpenID - obsługuję...`);
-          await ctx.reply('🔐 Family View na stronie logowania...');
           await handleFamilyView(ctx, page, userId);
           await new Promise(resolve => setTimeout(resolve, 3000));
           continue;
@@ -1005,21 +885,9 @@ async function waitForRedirectOrGuard(ctx, page, userId) {
         });
 
         if (hasSignInButton) {
-          logger.info(`${userId}: Znaleziono przycisk Sign In, klikam...`);
-
-          if (!session.lastConfirmTime || Date.now() - session.lastConfirmTime > 10000) {
-            await ctx.reply('✅ Potwierdzam logowanie przez Steam...');
-            session.lastConfirmTime = Date.now();
-          }
-
-          if (!session.lastQrTime || Date.now() - session.lastQrTime > 45000) {
-            await ctx.reply('📱 Zeskanuj ten kod...');
-            session.lastQrTime = Date.now();
-          }
-
+          logger.info(`[${userId}]: Znaleziono przycisk Sign In, klikam...`);
           try {
             await new Promise(resolve => setTimeout(resolve, 1500));
-
             await page.evaluate(() => {
               const button = document.querySelector('input[type="submit"][id="imageLogin"]') ||
                             document.querySelector('input[value="Sign In"]') ||
@@ -1029,7 +897,6 @@ async function waitForRedirectOrGuard(ctx, page, userId) {
                 button.click();
                 return true;
               }
-
               const form = document.querySelector('form[name="openidForm"], form[name="loginForm"]');
               if (form) {
                 form.submit();
@@ -1038,27 +905,16 @@ async function waitForRedirectOrGuard(ctx, page, userId) {
               return false;
             });
 
-            logger.info(`${userId}: Przycisk Sign In kliknięty`);
-            await new Promise(resolve => setTimeout(resolve, 2000));
-
-            logger.info(`${userId}: Sprawdzam czy po Sign In nie pojawił się Family View...`);
             await new Promise(resolve => setTimeout(resolve, 2000));
 
             const familyCheckAfterClick = await checkForFamilyView();
             if (familyCheckAfterClick.detected) {
-              logger.info(`${userId}: Family View pojawił się PO kliknięciu Sign In!`);
-              await ctx.reply('🔐 Family View po zalogowaniu - obsługuję...');
               await handleFamilyView(ctx, page, userId);
               await new Promise(resolve => setTimeout(resolve, 3000));
             }
-
           } catch (e) {
-            logger.error(`${userId}: Błąd klikania Sign In:`, e.message);
-            await ctx.reply('⚠️ Nie mogę automatycznie kliknąć - kliknij Sign In ręcznie');
+            logger.error(`[${userId}]: Błąd klikania Sign In:`, e.message);
           }
-        } else {
-          logger.warn(`${userId}: Nie znaleziono przycisku Sign In na stronie OpenID`);
-          await ctx.reply('⚠️ Nie znaleziono przycisku Sign In - kliknij ręcznie w przeglądarce');
         }
       }
 
@@ -1072,9 +928,9 @@ async function waitForRedirectOrGuard(ctx, page, userId) {
           return !!document.querySelector('input[type="email"], input[type="text"][placeholder*="code"], input[class*="Guard"], input[name*="twofactor"]');
         });
 
-        if (hasGuardInput) {
+        if (hasGuardInput && !ctx.isSilent) {
           logger.info(`🔐 [${userId}] Wykryto Steam Guard`);
-          await ctx.reply('🔐 Wymagany kod Steam Guard!\n\nWpisz kod z aplikacji lub maila w przeglądarce.\n⏳ Czekam 2 minuty...');
+          await ctx.reply('🔐 Wymagany kod Steam Guard!\n\nWpisz kod w przeglądarce.');
         }
       }
 
@@ -1088,26 +944,22 @@ async function waitForRedirectOrGuard(ctx, page, userId) {
       await new Promise(resolve => setTimeout(resolve, 2000));
     }
 
-    logger.info(`⏳ [${userId}] Czekam na ostateczne przekierowanie na g4skins...`);
+    logger.info(`⏳ [${userId}] Czekam na stronę g4skins...`);
     await page.waitForFunction(
       () => window.location.href.includes('g4skins.com'),
       { timeout: 30000 }
     );
 
-    logger.info(`✅ [${userId}] Przekierowano, sprawdzam logowanie...`);
-
   } catch (error) {
-    logger.error(`⚠️ [${userId}] Timeout:`, error.message);
-    await ctx.reply(
-      '⏰ Upłynął limit czasu oczekiwania.\n\n' +
-      'Możesz dokończyć logowanie ręcznie w otwartej przeglądarce.\n' +
-      'Użyj /logout aby zamknąć sesję lub /check aby sprawdzić status.'
-    );
+    logger.error(`⚠️ [${userId}] Timeout logowania:`, error.message);
+    if (!ctx.isSilent) {
+      await ctx.reply('⏰ Upłynął limit czasu oczekiwania na logowanie.');
+    }
     return false;
   }
 
   try {
-    await page.goto('https://g4skins.com/daily-case/open', { waitUntil: 'networkidle2', timeout: 15000 });
+    await page.goto(CONFIG.URLS.G4SKINS_DAILY, { waitUntil: 'networkidle2', timeout: 15000 });
 
     const loggedIn = await page.evaluate(() => {
       return !document.querySelector('.login-form-content');
@@ -1115,74 +967,183 @@ async function waitForRedirectOrGuard(ctx, page, userId) {
 
     if (loggedIn) {
       const cookies = await page.cookies();
-      saveSessionCookies(userId, cookies);
+      await saveSessionCookies(userId, cookies);
 
-      if (session) {
-        session.isLoggedIn = true;
-        setSessionAndTrack(userId, session);
-      }
+      session.isLoggedIn = true;
+      setSessionAndTrack(userId, session);
 
       logger.info(`✅ [${userId}] Zalogowano pomyślnie`);
-      await ctx.reply('✅ Zalogowano pomyślnie! Sesja zapisana.');
+      if (!ctx.isSilent) await ctx.reply('✅ Zalogowano pomyślnie! Sesja zapisana.');
       return true;
     } else {
-      await ctx.reply('⚠️ Logowanie wygląda na niezakończone. Spróbuj ponownie /login');
+      if (!ctx.isSilent) await ctx.reply('⚠️ Logowanie nie powiodło się. Spróbuj ponownie /login');
       return false;
     }
   } catch (error) {
-    logger.error(`⚠️ [${userId}] Błąd weryfikacji:`, error.message);
-    await ctx.reply('⚠️ Błąd przy weryfikacji logowania. Spróbuj /check');
+    logger.error(`⚠️ [${userId}] Błąd weryfikacji logowania:`, error.message);
     return false;
   }
 }
 
-// ====== G4SKINS API ======
+// ====== ZARZĄDZANIE SESJĄ PRZEGLĄDARKI (SILENT RUNNER) ======
 
-async function checkDailyCase(ctx) {
-  const userId = ctx.from.id.toString();
+/**
+ * Upewnia się, że przeglądarka jest otwarta i zalogowana.
+ * Odtwarza sesję z cookies lub loguje danymi Steam.
+ */
+async function ensureBrowserOpen(userId, ctx = null) {
   let session = activeSessions.get(userId);
 
-  const user = await loadUser(userId);
-  const hasSteamCredentials = user && user.steamUsername && user.steamPassword;
-
-  if (!session || !session.isLoggedIn || (session && !session.browser?.isConnected())) {
-    if (hasSteamCredentials) {
-      await ctx.reply('🔄 Nie jesteś zalogowany - automatyczne logowanie...');
-      logger.info(`🔄 [${userId}] Automatyczne logowanie dla /check`);
-      const loginSuccess = await loginToSteam(ctx, 'password');
-      if (!loginSuccess) {
-        return null;
+  // 1. Jeśli sesja ma już otwartą i połączoną przeglądarkę
+  if (session?.browser && session.browser.isConnected() && session?.page) {
+    try {
+      const currentUrl = session.page.url();
+      if (!currentUrl.includes('g4skins.com')) {
+        await session.page.goto(CONFIG.URLS.G4SKINS_DAILY, { waitUntil: 'networkidle2', timeout: 30000 });
       }
-      session = activeSessions.get(userId);
-    } else {
-      await ctx.reply('❌ Nie jesteś zalogowany! Użyj /login lub najpierw zapisz dane Steam komendą /setsteam');
-      return null;
+      return session;
+    } catch (e) {
+      logger.warn(`⚠️ [${userId}] Błąd nawigacji istniejącej strony: ${e.message}`);
     }
   }
 
-  if (!session || !session.page || !session.browser) {
-    logger.error(`❌ [${userId}] Sesja nie ma wymaganych właściwości (page/browser)`);
-    await ctx.reply('❌ Błąd sesji! Spróbuj zalogować się ponownie /login');
-    activeSessions.delete(userId);
+  logger.info(`🌐 [${userId}] Otwieram przeglądarkę (przywracanie sesji)...`);
+  const config = await getPuppeteerConfig();
+  let browser;
+
+  const maxRetries = 3;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      browser = isProduction ? await puppeteerCore.launch(config) : await puppeteer.launch({
+        headless: false,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas',
+          '--no-first-run',
+          '--no-zygote',
+          '--disable-gpu'
+        ]
+      });
+      break;
+    } catch (launchError) {
+      logger.error(`❌ [${userId}] Błąd uruchamiania przeglądarki (próba ${attempt}/${maxRetries}):`, launchError.message);
+      if (attempt === maxRetries) return null;
+      await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+    }
+  }
+
+  const page = await browser.newPage();
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+  await page.setViewport({ width: 1366, height: 768 });
+
+  // Odpięcie przeglądarki bez czyszczenia statusu zalogowania w bazie
+  browser.on('disconnected', () => {
+    logger.warn(`⚠️ [${userId}] Przeglądarka odłączona (zamknięcie/crash)`);
+    const s = activeSessions.get(userId);
+    if (s) {
+      s.browser = null;
+      s.page = null;
+      setSessionAndTrack(userId, s);
+    }
+  });
+
+  // 2. Spróbuj przywrócić z zapisanych cookies
+  const savedCookies = await loadSessionCookies(userId);
+  if (savedCookies && Array.isArray(savedCookies) && savedCookies.length > 0) {
+    const cleanedCookies = savedCookies.map(({ partitionKey, ...rest }) => rest);
+    await page.setCookie(...cleanedCookies);
+    await page.goto(CONFIG.URLS.G4SKINS_DAILY, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+
+    const isStillLoggedIn = await page.evaluate(() => {
+      return !document.querySelector('.login-form-content');
+    }).catch(() => false);
+
+    if (isStillLoggedIn) {
+      logger.info(`✅ [${userId}] Przeglądarka pomyślnie wznowiona z cookies`);
+      session = session || {};
+      session.browser = browser;
+      session.page = page;
+      session.isLoggedIn = true;
+      setSessionAndTrack(userId, session);
+      return session;
+    } else {
+      logger.warn(`⚠️ [${userId}] Cookies wygasły lub nie są już ważne`);
+    }
+  }
+
+  // 3. Jeśli cookies nie zadziałały, spróbuj automatycznego logowania przez Steam
+  const user = await loadUser(userId);
+  if (user?.steamUsername && user?.steamPassword) {
+    logger.info(`🔄 [${userId}] Próba automatycznego ponownego logowania Steam...`);
+    session = session || {};
+    session.browser = browser;
+    session.page = page;
+    setSessionAndTrack(userId, session);
+
+    const loginCtx = ctx || {
+      from: { id: parseInt(userId, 10) },
+      isSilent: true,
+      reply: async (text) => logger.info(`[${userId}] AutoLogin: ${text}`)
+    };
+
+    const loggedIn = await loginToSteam(loginCtx, 'password');
+    if (loggedIn) {
+      return activeSessions.get(userId);
+    }
+  }
+
+  // Jeśli wszystko zawiodło, zamknij nowo otwartą przeglądarkę
+  try {
+    await browser.close();
+  } catch (e) {}
+
+  logger.error(`❌ [${userId}] Nie udało się otworzyć zalogowanej sesji`);
+  return null;
+}
+
+/**
+ * Ciche zamykanie przeglądarki w celu oszczędzania RAM,
+ * zachowując dane harmonogramu AutoOpen.
+ */
+async function closeBrowserSilently(userId) {
+  const session = activeSessions.get(userId);
+  if (session?.browser) {
+    try {
+      await session.browser.close();
+      logger.info(`🧹 [${userId}] Przeglądarka zamknięta w tle (oszczędzanie RAM)`);
+    } catch (e) {
+      logger.warn(`⚠️ [${userId}] Błąd cichego zamykania przeglądarki: ${e.message}`);
+    } finally {
+      session.browser = null;
+      session.page = null;
+      setSessionAndTrack(userId, session);
+    }
+  }
+}
+
+// ====== G4SKINS API & OPERATIONS ======
+
+async function checkDailyCase(ctx) {
+  const userId = ctx.from.id.toString();
+  const sessionObj = await ensureBrowserOpen(userId, ctx);
+
+  if (!sessionObj || !sessionObj.page || !sessionObj.browser?.isConnected()) {
+    if (!ctx.isSilent) await ctx.reply('❌ Nie jesteś zalogowany! Użyj /login lub najpierw zapisz dane Steam komendą /setsteam');
     return null;
   }
 
-  const { page, browser } = session;
-
-  if (!browser.isConnected()) {
-    await ctx.reply('❌ Przeglądarka została zamknięta! Zaloguj się ponownie /login');
-    activeSessions.delete(userId);
-    return null;
-  }
+  const { page } = sessionObj;
 
   try {
-    await page.goto('https://g4skins.com/daily-case/open', { waitUntil: 'networkidle2' });
+    await page.goto(CONFIG.URLS.G4SKINS_DAILY, { waitUntil: 'networkidle2', timeout: 30000 });
     logger.info(`🔍 [${userId}] Sprawdzam daily case...`);
 
     const caseInfo = await page.evaluate(() => {
       return new Promise((resolve) => {
         let waited = 0;
-        const maxWait = 2000;
+        const maxWait = 3000;
         const step = 100;
 
         const interval = setInterval(() => {
@@ -1191,7 +1152,6 @@ async function checkDailyCase(ctx) {
 
           if (btn) {
             clearInterval(interval);
-
             const isBlocked = btn.classList.contains('block');
 
             if (isBlocked) {
@@ -1214,90 +1174,63 @@ async function checkDailyCase(ctx) {
     });
 
     if (!caseInfo.found) {
-      await ctx.reply('⚠️ Nie znaleziono przycisku daily case');
-      logger.warn(`⚠️ [${userId}] Przycisk nie znaleziony`);
+      if (!ctx.isSilent) await ctx.reply('⚠️ Nie znaleziono przycisku daily case');
+      logger.warn(`⚠️ [${userId}] Przycisk daily case nie znaleziony`);
       return null;
     }
 
     if (caseInfo.blocked) {
-      const timeParts = caseInfo.time.split(':');
-      let timeFormatted = caseInfo.time;
+      const timeMs = parseTimeToMs(caseInfo.time);
+      const timeFormatted = formatTimeMs(timeMs);
 
-      if (timeParts.length === 3) {
-        const [godz, min, sek] = timeParts;
-        timeFormatted = `${godz}h ${min}m ${sek}s`;
-      }
-
-      await ctx.reply(`⏰ Daily case dostępny za: ${timeFormatted}`);
-      logger.info(`⏰ [${userId}] Daily case zablokowany: ${timeFormatted}`);
-      return { blocked: true, time: caseInfo.time, timeFormatted };
+      if (!ctx.isSilent) await ctx.reply(`⏰ Daily case dostępny za: ${timeFormatted}`);
+      logger.info(`⏰ [${userId}] Daily case zablokowany: ${timeFormatted} (raw: "${caseInfo.time}")`);
+      return { found: true, blocked: true, time: caseInfo.time, timeFormatted, timeMs };
     }
 
-    await ctx.reply('✅ Daily case jest dostępny!');
-    logger.info(`✅ [${userId}] Daily case dostępny`);
-    return { blocked: false };
+    if (!ctx.isSilent) await ctx.reply('✅ Daily case jest dostępny!');
+    logger.info(`✅ [${userId}] Daily case dostępny do otwarcia`);
+    return { found: true, blocked: false };
 
   } catch (error) {
-    logger.error(`❌ [${userId}] Błąd sprawdzania:`, error.message);
-    await ctx.reply(`❌ Błąd: ${error.message}`);
+    logger.error(`❌ [${userId}] Błąd sprawdzania daily case:`, error.message);
+    if (!ctx.isSilent) await ctx.reply(`❌ Błąd: ${error.message}`);
     return null;
   }
 }
 
 async function openDailyCase(ctx) {
   const userId = ctx.from.id.toString();
-  let session = activeSessions.get(userId);
+  const sessionObj = await ensureBrowserOpen(userId, ctx);
 
-  const user = await loadUser(userId);
-  const hasSteamCredentials = user && user.steamUsername && user.steamPassword;
-
-  if (!session || !session.isLoggedIn || (session && !session.browser?.isConnected())) {
-    if (hasSteamCredentials) {
-      await ctx.reply('🔄 Nie jesteś zalogowany - automatyczne logowanie...');
-      logger.info(`🔄 [${userId}] Automatyczne logowanie dla /open`);
-      const loginSuccess = await loginToSteam(ctx, 'password');
-      if (!loginSuccess) {
-        return false;
-      }
-      session = activeSessions.get(userId);
-    } else {
-      await ctx.reply('❌ Nie jesteś zalogowany! Użyj /login lub najpierw zapisz dane Steam komendą /setsteam');
-      return false;
-    }
-  }
-
-  if (!session || !session.page || !session.browser) {
-    logger.error(`❌ [${userId}] Sesja nie ma wymaganych właściwości (page/browser)`);
-    await ctx.reply('❌ Błąd sesji! Spróbuj zalogować się ponownie /login');
-    activeSessions.delete(userId);
+  if (!sessionObj || !sessionObj.page || !sessionObj.browser?.isConnected()) {
+    if (!ctx.isSilent) await ctx.reply('❌ Nie jesteś zalogowany! Użyj /login lub najpierw zapisz dane Steam komendą /setsteam');
     return false;
   }
 
-  const { page, browser } = session;
-
-  if (!browser.isConnected()) {
-    await ctx.reply('❌ Przeglądarka została zamknięta! Zaloguj się ponownie /login');
-    activeSessions.delete(userId);
-    return false;
-  }
+  const { page } = sessionObj;
 
   try {
-    await page.goto('https://g4skins.com/daily-case/open', { waitUntil: 'networkidle2' });
+    await page.goto(CONFIG.URLS.G4SKINS_DAILY, { waitUntil: 'networkidle2', timeout: 30000 });
     logger.info(`📦 [${userId}] Przygotowuję do otwarcia daily case...`);
 
-    await ctx.reply('📦 Sprawdzam ekwipunek przed otwarciem...');
+    if (!ctx.isSilent) await ctx.reply('📦 Sprawdzam ekwipunek przed otwarciem...');
 
     const inventoryBefore = await page.evaluate(async (apiUrl) => {
-      const response = await fetch(apiUrl, {
-        method: 'GET',
-        credentials: 'include'
-      });
-      if (!response.ok) return [];
-      const data = await response.json();
-      return (data.result || []).map(item => ({
-        name: item.name,
-        value: item.value
-      }));
+      try {
+        const response = await fetch(apiUrl, {
+          method: 'GET',
+          credentials: 'include'
+        });
+        if (!response.ok) return [];
+        const data = await response.json();
+        return (data.result || []).map(item => ({
+          name: item.name,
+          value: item.value
+        }));
+      } catch (e) {
+        return [];
+      }
     }, CONFIG.URLS.G4SKINS_API_INVENTORY);
 
     logger.info(`📦 [${userId}] Ekwipunek przed: ${inventoryBefore.length} itemów`);
@@ -1305,7 +1238,7 @@ async function openDailyCase(ctx) {
     const result = await page.evaluate(() => {
       return new Promise((resolve) => {
         let waited = 0;
-        const maxWait = 2000;
+        const maxWait = 3000;
         const step = 100;
 
         const interval = setInterval(() => {
@@ -1337,327 +1270,406 @@ async function openDailyCase(ctx) {
     });
 
     if (result.notFound) {
-      await ctx.reply('❌ Nie znaleziono przycisku daily case');
+      if (!ctx.isSilent) await ctx.reply('❌ Nie znaleziono przycisku daily case');
       return false;
     }
 
     if (result.blocked) {
-      const timeParts = result.time.split(':');
-      let timeFormatted = result.time;
-      if (timeParts.length === 3) {
-        const [godz, min, sek] = timeParts;
-        timeFormatted = `${godz}h ${min}m ${sek}s`;
-      }
-      await ctx.reply(`❌ Daily case zablokowany! Dostępny za: ${timeFormatted}`);
+      const timeMs = parseTimeToMs(result.time);
+      const timeFormatted = formatTimeMs(timeMs);
+      if (!ctx.isSilent) await ctx.reply(`❌ Daily case zablokowany! Dostępny za: ${timeFormatted}`);
       return false;
     }
 
-    await ctx.reply('🎁 Otwieranie daily case...');
-    logger.info(`🎁 [${userId}] Otwarto daily case, czekam 3 sekundy...`);
+    if (!ctx.isSilent) await ctx.reply('🎁 Otwieranie daily case...');
+    logger.info(`🎁 [${userId}] Otwarto daily case, czekam na zatwierdzenie dropu...`);
 
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    await new Promise(resolve => setTimeout(resolve, 4000));
 
     const inventoryAfter = await page.evaluate(async (apiUrl) => {
-      const response = await fetch(apiUrl, {
-        method: 'GET',
-        credentials: 'include'
-      });
-      if (!response.ok) return [];
-      const data = await response.json();
-      return (data.result || []).map(item => ({
-        name: item.name,
-        value: item.value
-      }));
+      try {
+        const response = await fetch(apiUrl, {
+          method: 'GET',
+          credentials: 'include'
+        });
+        if (!response.ok) return [];
+        const data = await response.json();
+        return (data.result || []).map(item => ({
+          name: item.name,
+          value: item.value
+        }));
+      } catch (e) {
+        return [];
+      }
     }, CONFIG.URLS.G4SKINS_API_INVENTORY);
 
     logger.info(`📦 [${userId}] Ekwipunek po: ${inventoryAfter.length} itemów`);
 
-        // Kopiujemy stary ekwipunek, aby odznaczać z niego sztuki
-        let tempBefore = [...inventoryBefore];
-        let newItems = [];
+    let tempBefore = [...inventoryBefore];
+    let newItems = [];
 
-        // Niezawodne wyszukiwanie nowych przedmiotów (rozwiązuje problem gdy wydropisz duplikat)
-        for (const item of inventoryAfter) {
-          const foundIndex = tempBefore.findIndex(b => b.name === item.name);
-          if (foundIndex !== -1) {
-            // Był już, usuwamy JEDNĄ sztukę z tymczasowej listy
-            tempBefore.splice(foundIndex, 1);
-          } else {
-            // Nie było go (lub to kolejna nowa sztuka), więc to jest nasz nowy drop!
-            newItems.push(item);
-          }
-        }
-
-        // Wysyłanie odpowiedniego powiadomienia
-        if (newItems.length === 0) {
-          await bot.telegram.sendMessage(userId, '🎲 Dostałeś prawdopodobnie skrzynię lub EXP (sprawdź historię)');
-          logger.info(`🎲 [${userId}] Brak nowych itemów (wpadł EXP lub skrzynka)`);
-        } else {
-          const skinsWithValue = newItems.map(item =>
-            `${item.name} (${(item.value * 4).toFixed(2)} zł)`
-          ).join('\n');
-
-          await bot.telegram.sendMessage(userId, `🎁 Dostałeś:\n\n${skinsWithValue}`);
-          logger.info(`✨ [${userId}] Nowe itemy: ${newItems.length} (${newItems.map(i => i.name).join(', ')})`);
-        }
-
-        return true;
-  } catch (error) {
-    logger.error(`❌ [${userId}] Błąd otwierania:`, error.message);
-    await ctx.reply(`❌ Błąd: ${error.message}`);
-    return false;
-  } finally {
-    if (ctx?.isSilent) {
-      const currentSession = activeSessions.get(userId);
-      if (currentSession && currentSession.browser && currentSession.browser.isConnected()) {
-        try {
-          await currentSession.browser.close();
-          currentSession.browser = null;
-          currentSession.page = null;
-          setSessionAndTrack(userId, currentSession);
-          logger.info(`🧹 [${userId}] Przeglądarka zamknięta po openDailyCase (cleanup)`);
-        } catch (e) {
-          logger.warn(`⚠️ [${userId}] Błąd zamykania przeglądarki w finally:`, e.message);
-        }
+    for (const item of inventoryAfter) {
+      const foundIndex = tempBefore.findIndex(b => b.name === item.name);
+      if (foundIndex !== -1) {
+        tempBefore.splice(foundIndex, 1);
+      } else {
+        newItems.push(item);
       }
     }
+
+    if (newItems.length === 0) {
+      await bot.telegram.sendMessage(userId, '🎲 Dostałeś prawdopodobnie skrzynię lub EXP (sprawdź historię dropów na stronie)');
+      logger.info(`🎲 [${userId}] Brak nowych skinów (prawdopodobnie EXP lub skrzynka)`);
+    } else {
+      const skinsWithValue = newItems.map(item =>
+        `✨ ${item.name} (${(item.value * 4).toFixed(2)} zł)`
+      ).join('\n');
+
+      await bot.telegram.sendMessage(userId, `🎁 Otrzymałeś z Daily Case:\n\n${skinsWithValue}`);
+      logger.info(`✨ [${userId}] Nowe itemy: ${newItems.length} (${newItems.map(i => i.name).join(', ')})`);
+    }
+
+    // Odczytaj nowy timer ze strony po otwarciu
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    const newTimerText = await page.evaluate(() => {
+      const container = document.querySelector('.top-options');
+      const btn = container ? container.querySelector('.G_Button.big.max') : null;
+      if (btn && btn.classList.contains('block')) {
+        const timeDiv = btn.querySelector('.button_text');
+        return timeDiv ? timeDiv.textContent.trim() : null;
+      }
+      return null;
+    });
+
+    let newCooldownMs = null;
+    if (newTimerText) {
+      newCooldownMs = parseTimeToMs(newTimerText);
+      logger.info(`⏱️ [${userId}] Nowy cooldown odczytany ze strony: ${newTimerText} (${formatTimeMs(newCooldownMs)})`);
+    }
+
+    return {
+      success: true,
+      newCooldownTime: newTimerText,
+      newCooldownMs: newCooldownMs
+    };
+
+  } catch (error) {
+    logger.error(`❌ [${userId}] Błąd otwierania daily case:`, error.message);
+    if (!ctx.isSilent) await ctx.reply(`❌ Błąd: ${error.message}`);
+    return false;
   }
 }
 
-// ====== AUTOOPEN (SMART SCHEDULER & DB PERSISTENCE) ======
+// ====== SMART SCHEDULER & AUTOOPEN ENGINE ======
 
-const autoOpenNotificationTracker = new Map();
+/**
+ * Ustawia i zapisuje precyzyjny czas następnego wywołania
+ */
+function scheduleUserNext(userId, delayMs) {
+  let session = activeSessions.get(userId);
+  if (!session) {
+    session = { isLoggedIn: true };
+  }
 
-async function startAutoOpen(ctx, bufferSeconds = 10, initialDelay = 0) {
-  const userId = ctx.from.id.toString();
-  const session = activeSessions.get(userId);
+  if (session.autoOpenTimeout) {
+    clearTimeout(session.autoOpenTimeout);
+    session.autoOpenTimeout = null;
+  }
 
-  if (!session || !session.isLoggedIn) {
-    await ctx.reply('❌ Nie jesteś zalogowany! Użyj /login');
+  const nextCaseTime = Date.now() + delayMs;
+  session.autoOpenEnabled = true;
+  session.nextCaseTime = nextCaseTime;
+
+  // Uruchomienie precyzyjnego timera Node.js
+  const timeout = setTimeout(async () => {
+    logger.info(`⏰ [${userId}] Precyzyjny timer obudził Smart Scheduler!`);
+    await runAutoOpenCheck(userId, false);
+  }, delayMs);
+
+  session.autoOpenTimeout = timeout;
+  setSessionAndTrack(userId, session);
+
+  // Aktualizacja w MongoDB
+  User.findOneAndUpdate(
+    { telegramId: userId },
+    { autoOpenEnabled: true, nextCaseTime: nextCaseTime },
+    { upsert: true }
+  ).catch(e => logger.error(`⚠️ [${userId}] Błąd zapisu harmonogramu w bazie:`, e.message));
+
+  const minutesLeft = Math.ceil(delayMs / 60000);
+  const targetDateStr = new Date(nextCaseTime).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit' });
+  logger.info(`🗓️ [${userId}] AutoOpen zaplanowany za ~${minutesLeft} min (godz. ${targetDateStr})`);
+}
+
+/**
+ * Główna procedura wykonawcza AutoOpen:
+ * 1. Otwiera przeglądarkę
+ * 2. Sprawdza stan skrzynki
+ * 3. Jeśli zablokowana: planuje następny cykl i zamyka przeglądarkę
+ * 4. Jeśli dostępna: otwiera, wysyła drop, odczytuje nowy cooldown (~19h), planuje i zamyka przeglądarkę
+ */
+async function runAutoOpenCheck(userId, isManual = false) {
+  if (autoOpenLocks.get(userId)) {
+    logger.warn(`⚠️ [${userId}] AutoOpen już w trakcie wykonywania, pomijam duplikat`);
     return;
   }
 
-  if (session.autoOpenTimeout && initialDelay === 0) {
-    await ctx.reply('⚠️ AutoOpen już działa!');
-    return;
-  }
+  autoOpenLocks.set(userId, true);
 
-  if (initialDelay === 0) {
-    await ctx.reply('🔄 AutoOpen uruchomiony (smart scheduler)');
-    logger.info(`▶️ [${userId}] AutoOpen uruchomiony (smart scheduler)`);
-  }
-
-  function parseTimeToMs(timeStr) {
-    const parts = timeStr.split(':').map(Number);
-    if (parts.length === 3) {
-      const [h, m, s] = parts;
-      return (h * 3600 + m * 60 + s) * 1000;
-    }
-    return 5 * 60 * 1000;
-  }
-
-  async function ensureBrowserOpen() {
-    try {
-      const currentSession = activeSessions.get(userId);
-      if (!currentSession) return false;
-
-      if (!currentSession.browser || !currentSession.page) {
-        const config = await getPuppeteerConfig();
-        const newBrowser = isProduction ? await puppeteerCore.launch(config) : await puppeteer.launch({
-          headless: false,
-          args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--disable-gpu'
-          ]
-        });
-        const newPage = await newBrowser.newPage();
-        await newPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-        await newPage.setViewport({ width: 1366, height: 768 });
-
-        const savedCookies = await loadSessionCookies(userId);
-        if (savedCookies && Array.isArray(savedCookies)) {
-          const cleanedCookies = savedCookies.map(({ partitionKey, ...rest }) => rest);
-          await newPage.setCookie(...cleanedCookies);
-        }
-
-        await newPage.goto('https://g4skins.com/daily-case/open', { waitUntil: 'networkidle2' });
-
-        const isStillLoggedIn = await newPage.evaluate(() => {
-          return !document.querySelector('.login-form-content');
-        });
-
-        if (isStillLoggedIn) {
-          logger.info(`🔄 [${userId}] Przeglądarka przywrócona z cookies`);
-          currentSession.browser = newBrowser;
-          currentSession.page = newPage;
-          setSessionAndTrack(userId, currentSession);
-          return true;
-        } else {
-          await newBrowser.close();
-          logger.error(`❌ [${userId}] Cookies wygasły`);
-          return false;
-        }
+  try {
+    const silentCtx = {
+      from: { id: parseInt(userId, 10) },
+      isSilent: true,
+      reply: async (text) => {
+        logger.info(`[${userId}] AutoOpen: ${text}`);
       }
+    };
 
-      if (currentSession.browser.isConnected && !currentSession.browser.isConnected()) {
-        await currentSession.browser.close();
-        currentSession.browser = null;
-        currentSession.page = null;
-        setSessionAndTrack(userId, currentSession);
-        return false;
-      }
-
-      return true;
-    } catch (e) {
-      logger.error(`⚠️ [${userId}] Błąd otwierania przeglądarki:`, e.message);
-      return false;
-    }
-  }
-
-  async function checkAndSchedule() {
-    const currentSession = activeSessions.get(userId);
-    if (!currentSession || !currentSession.isLoggedIn) return;
-
-    if (autoOpenLocks.get(userId)) {
-      logger.warn(`⚠️ [${userId}] AutoOpen już w trakcie wykonywania, pomijam duplikat`);
+    const sessionObj = await ensureBrowserOpen(userId, silentCtx);
+    if (!sessionObj) {
+      logger.error(`❌ [${userId}] AutoOpen: Nie udało się przygotować zalogowanej sesji`);
+      // Retry za 15 minut
+      scheduleUserNext(userId, 15 * 60 * 1000);
       return;
     }
 
-    autoOpenLocks.set(userId, true);
+    const checkResult = await checkDailyCase(silentCtx);
 
-    try {
-      const opened = await ensureBrowserOpen();
-      if (!opened) {
-        scheduleNext(5 * 60 * 1000);
-        return;
-      }
+    if (!checkResult || !checkResult.found) {
+      logger.warn(`⚠️ [${userId}] AutoOpen: Nie znaleziono przycisku daily case, ponawiam za 5 min`);
+      await closeBrowserSilently(userId);
+      scheduleUserNext(userId, 5 * 60 * 1000);
+      return;
+    }
 
-      const silentCtx = {
-        from: { id: userId },
-        isSilent: true,
-        reply: async (text) => {
-          logger.info(`[${userId}] AutoOpen: ${text}`);
-        }
-      };
+    if (checkResult.blocked) {
+      // Skrzynka zablokowana – wylicz czas + 5 sekund bufora bezpieczeństwa
+      const delay = (checkResult.timeMs || parseTimeToMs(checkResult.time)) + 5000;
+      const minutesLeft = Math.ceil(delay / 60000);
+      const targetTime = new Date(Date.now() + delay).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit' });
 
-      const result = await checkDailyCase(silentCtx);
+      // Natychmiast zwalniamy RAM zamykając przeglądarkę
+      await closeBrowserSilently(userId);
 
-      if (!result) {
-        scheduleNext(5 * 60 * 1000);
-        return;
-      }
+      // Zaplanuj kolejne obudzenie
+      scheduleUserNext(userId, delay);
 
-      if (!result.blocked) {
-        await bot.telegram.sendMessage(userId, '🎁 Otwieram daily case!');
-        await openDailyCase(silentCtx);
-
-        const delay = 20 * 60 * 60 * 1000 + bufferSeconds * 1000;
-        await User.findOneAndUpdate({ telegramId: userId }, { autoOpenEnabled: true, nextCaseTime: Date.now() + delay }).catch(() => {});
-        scheduleNext(delay);
-      } else {
-        const delay = parseTimeToMs(result.time) + bufferSeconds * 1000;
-        const minutesLeft = Math.ceil(delay / 60000);
-        logger.info(`[${userId}] AutoOpen: case za ${result.timeFormatted}, sprawdzam za ~${minutesLeft} min`);
+      if (isManual) {
         await bot.telegram.sendMessage(
           userId,
-          `⏳ Daily case dostępny za ${result.timeFormatted}\n🔔 Otworzę automatycznie za ~${minutesLeft} min`
+          `⏳ Daily case dostępny za ${checkResult.timeFormatted || checkResult.time}\n` +
+          `🔔 AutoOpen otworzy skrzynkę automatycznie o godz. ${targetTime} (za ~${minutesLeft} min)`
         );
-        await closeBrowserSilently(userId);
-
-        await User.findOneAndUpdate({ telegramId: userId }, { autoOpenEnabled: true, nextCaseTime: Date.now() + delay }).catch(() => {});
-        scheduleNext(delay);
+      } else {
+        logger.info(`[${userId}] AutoOpen: case zablokowany (${checkResult.timeFormatted}), sprawdzam o ${targetTime}`);
       }
-    } finally {
-      autoOpenLocks.delete(userId);
-    }
-  }
 
-  function scheduleNext(delay) {
-    const currentSession = activeSessions.get(userId);
-    if (!currentSession) return;
-    const timeout = setTimeout(checkAndSchedule, delay);
-    currentSession.autoOpenTimeout = timeout;
-    setSessionAndTrack(userId, currentSession);
-  }
+    } else {
+      // Skrzynka gotowa do otwarcia!
+      logger.info(`🎁 [${userId}] AutoOpen: Daily case jest gotowy! Otwieram...`);
+      await bot.telegram.sendMessage(userId, '🎁 Daily case jest dostępny! Otwieram automatycznie...');
 
-  async function closeBrowserSilently(userId) {
-    const s = activeSessions.get(userId);
-    if (s?.browser) {
-      try {
-        await s.browser.close();
-        logger.info(`🧹 [${userId}] Przeglądarka zamknięta (silent cleanup)`);
-      } catch (e) {
-        logger.warn(`⚠️ [${userId}] Błąd zamykania przeglądarki:`, e.message);
-      } finally {
-        s.browser = null;
-        s.page = null;
-        setSessionAndTrack(userId, s);
+      const openResult = await openDailyCase(silentCtx);
+
+      // Po otwarciu ustalamy kolejny cykl (odczytany ze strony lub domyślnie 19h 40m)
+      let nextDelay = (19 * 3600 + 40 * 60) * 1000 + 5000;
+
+      if (openResult && openResult.newCooldownMs && openResult.newCooldownMs > 60000) {
+        nextDelay = openResult.newCooldownMs + 5000;
       }
-    }
-  }
 
-  if (initialDelay > 0) {
-    scheduleNext(initialDelay);
-  } else {
-    await checkAndSchedule();
+      const nextHours = (nextDelay / 3600000).toFixed(1);
+      const nextTargetTime = new Date(Date.now() + nextDelay).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit' });
+
+      // Zwalniamy RAM
+      await closeBrowserSilently(userId);
+
+      // Planujemy kolejny dzień
+      scheduleUserNext(userId, nextDelay);
+
+      await bot.telegram.sendMessage(
+        userId,
+        `⏳ Następny daily case za ~${nextHours}h (godz. ${nextTargetTime}).\nSmart Scheduler czuwa w tle!`
+      );
+    }
+
+  } catch (err) {
+    logger.error(`❌ [${userId}] Błąd w trakcie runAutoOpenCheck:`, err);
+    await closeBrowserSilently(userId);
+    scheduleUserNext(userId, 5 * 60 * 1000);
+  } finally {
+    autoOpenLocks.delete(userId);
   }
 }
 
-function stopAutoOpen(ctx) {
+/**
+ * Rozpoczęcie AutoOpen przez użytkownika
+ */
+async function startAutoOpen(ctx) {
   const userId = ctx.from.id.toString();
-  const session = activeSessions.get(userId);
 
-  if (!session || !session.autoOpenTimeout) {
-    ctx.reply('⚠️ AutoOpen nie jest włączony');
+  // Sprawdź czy użytkownik ma zapisane dane lub cookies
+  const user = await loadUser(userId);
+  const cookies = await loadSessionCookies(userId);
+  const hasAuth = (user?.steamUsername && user?.steamPassword) || (cookies && cookies.length > 0);
+
+  if (!hasAuth) {
+    await ctx.reply('❌ Nie jesteś zalogowany ani nie masz zapisanych danych!\nUżyj /login lub /setsteam');
     return;
   }
 
-  clearTimeout(session.autoOpenTimeout);
-  session.autoOpenTimeout = null;
-  setSessionAndTrack(userId, session);
+  let session = activeSessions.get(userId);
+  if (!session) {
+    session = { isLoggedIn: true };
+    setSessionAndTrack(userId, session);
+  }
 
-  autoOpenNotificationTracker.delete(userId);
+  await ctx.reply('🔄 Smart Scheduler (AutoOpen) uruchomiony!\nSprawdzam skrzynkę...');
+  logger.info(`▶️ [${userId}] AutoOpen uruchomiony ręcznie komendą /autoopen`);
 
-  User.findOneAndUpdate({ telegramId: userId }, { autoOpenEnabled: false, nextCaseTime: null }).catch(() => {});
-
-  logger.info(`⏹️ [${userId}] AutoOpen zatrzymany ręcznie`);
-  ctx.reply('⏹️ AutoOpen zatrzymany');
+  await runAutoOpenCheck(userId, true);
 }
+
+/**
+ * Zatrzymanie AutoOpen
+ */
+async function stopAutoOpen(ctx) {
+  const userId = ctx.from.id.toString();
+  const session = activeSessions.get(userId);
+
+  if (session?.autoOpenTimeout) {
+    clearTimeout(session.autoOpenTimeout);
+    session.autoOpenTimeout = null;
+  }
+
+  if (session) {
+    session.autoOpenEnabled = false;
+    session.nextCaseTime = null;
+    setSessionAndTrack(userId, session);
+  }
+
+  await User.findOneAndUpdate(
+    { telegramId: userId },
+    { autoOpenEnabled: false, nextCaseTime: null }
+  ).catch(() => {});
+
+  lastWatchdogLogTime.delete(userId);
+  logger.info(`⏹️ [${userId}] AutoOpen zatrzymany`);
+  await ctx.reply('⏹️ Smart Scheduler (AutoOpen) został zatrzymany.');
+}
+
+/**
+ * Watchdog: Okresowo (co 30s) weryfikuje stan odliczania w tle.
+ * Jeśli nadszedł czas – natychmiast odpala otwieranie.
+ * Co ~10 minut sporadycznie loguje w konsoli ile zostało bez spamu usera.
+ */
+function startAutoOpenWatchdog() {
+  setInterval(async () => {
+    try {
+      const now = Date.now();
+
+      // Pobierz wszystkich aktywnych z bazy danych dla pewności
+      const activeUsers = await User.find({ autoOpenEnabled: true }).catch(() => []);
+
+      for (const userDoc of activeUsers) {
+        const userId = userDoc.telegramId;
+        const nextCaseTime = userDoc.nextCaseTime;
+
+        if (!nextCaseTime) continue;
+
+        const remainingMs = nextCaseTime - now;
+
+        // Jeśli czas nadszedł i nie trwa właśnie otwieranie
+        if (remainingMs <= 0) {
+          if (!autoOpenLocks.get(userId)) {
+            logger.info(`⏰ [Watchdog] [${userId}] Czas nadszedł! Uruchamiam sprawdzanie/otwieranie skrzynki...`);
+            runAutoOpenCheck(userId, false);
+          }
+        } else {
+          // Logowanie w tle co 10 minut w konsoli
+          const lastLog = lastWatchdogLogTime.get(userId) || 0;
+          if (now - lastLog > 10 * 60 * 1000) {
+            lastWatchdogLogTime.set(userId, now);
+            const minsLeft = Math.ceil(remainingMs / 60000);
+            const targetTimeStr = new Date(nextCaseTime).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit' });
+            logger.info(`⏱️ [Watchdog] [${userId}] AutoOpen odlicza w tle: pozostało ~${minsLeft} min (otwarcie o ${targetTimeStr})`);
+          }
+        }
+      }
+    } catch (e) {
+      logger.error('⚠️ Błąd w AutoOpen Watchdog loop:', e.message);
+    }
+  }, 30 * 1000);
+}
+
+/**
+ * Przywracanie AutoOpen po restarcie serwera / bota
+ */
+async function restoreAutoOpenTasks() {
+  try {
+    const users = await User.find({ autoOpenEnabled: true });
+    if (users.length === 0) return;
+
+    logger.info(`🔄 Przywracanie AutoOpen dla ${users.length} użytkowników...`);
+
+    for (const user of users) {
+      const userId = user.telegramId;
+      const now = Date.now();
+
+      let delay = user.nextCaseTime ? (user.nextCaseTime - now) : 5000;
+      if (delay < 0) {
+        delay = 5000 + Math.floor(Math.random() * 10000);
+      }
+
+      let session = activeSessions.get(userId);
+      if (!session) {
+        session = { isLoggedIn: true, autoOpenEnabled: true, nextCaseTime: user.nextCaseTime };
+        setSessionAndTrack(userId, session);
+      }
+
+      logger.info(`🗓️ [${userId}] AutoOpen przywrócony - sprawdzenie nastąpi za ~${Math.round(delay / 60000)} min`);
+      scheduleUserNext(userId, delay);
+    }
+  } catch (e) {
+    logger.error('❌ Błąd podczas przywracania AutoOpen z bazy danych:', e.message);
+  }
+}
+
+// ====== TELEGRAM COMMANDS ======
 
 const commands = [
   { command: '/start', description: 'Wszystkie komendy' },
   { command: '/login', description: 'Wybierz metodę logowania' },
-  { command: '/autoopen', description: 'Włącz AutoOpen' },
-  { command: '/close', description: 'Zamknij przeglądarkę' },
+  { command: '/autoopen', description: 'Włącz Smart Scheduler' },
+  { command: '/checkstatus', description: 'Status Smart Schedulera' },
+  { command: '/check', description: 'Sprawdź daily case' },
+  { command: '/open', description: 'Otwórz daily case' },
+  { command: '/stop', description: 'Zatrzymaj Smart Scheduler' },
+  { command: '/close', description: 'Zamknij okno przeglądarki' },
 ];
 
 bot.command('start', (ctx) => {
   ctx.reply(
     '🤖 G4Skins Daily Case Bot\n\n' +
     '📋 Komendy:\n' +
-    '/setsteam - Zapisz dane Steam (login/hasło)\n' +
-    '/setpin - Zapisz PIN Family View (opcjonalnie)\n' +
+    '/setsteam - Zapisz dane Steam (login:hasło)\n' +
+    '/setpin - Zapisz PIN Family View (PIN:1234)\n' +
     '/login - Wybierz metodę logowania\n' +
     '/check - Sprawdź status daily case\n' +
     '/open - Otwórz daily case\n' +
-    '/autoopen - Włącz AutoOpen\n' +
+    '/autoopen - Włącz Smart Scheduler (AutoOpen)\n' +
     '/checkstatus - Status AutoOpen\n' +
     '/stop - Zatrzymaj AutoOpen\n' +
-    '/logout - Wyloguj się\n' +
+    '/logout - Wyloguj się i usuń sesję\n' +
     '/resetall - ZAMKNIJ WSZYSTKIE SESJE (admin)\n' +
-    '/close - Zamknij przeglądarkę\n' +
+    '/close - Zamknij przeglądarkę (oszczędność RAM)\n' +
     '/dbtest - Sprawdź status bazy danych\n' +
     '/status - Sprawdź status sesji\n\n' +
-    '💡 AutoOpen:\n' +
-    '• Odlicza precyzyjny czas do skrzynki\n' +
-    '• Zamyka przeglądarkę w tle (oszczędza RAM)\n' +
-    '• Automatycznie otwiera case i wznawia odliczanie\n' +
-    '• Pamięta harmonogram po restarcie serwera'
+    '💡 Smart Scheduler (AutoOpen):\n' +
+    '• Precyzyjnie odlicza czas do następnej skrzynki\n' +
+    '• Zamyka przeglądarkę w tle, oszczędzając pamięć RAM\n' +
+    '• Samodzielnie otwiera skrzynkę w wyznaczonym czasie i wysyła drop\n' +
+    '• Pamięta harmonogram po restarcie bota i kontynuuje działanie bez przerwy'
   );
 });
 
@@ -1681,6 +1693,7 @@ bot.command('dbtest', async (ctx) => {
 🔐 Password: ${user.steamPassword ? '***' : 'BRAK'}
 🔢 PIN: ${user.familyViewPin || 'BRAK'}
 🔄 AutoOpen w bazie: ${user.autoOpenEnabled ? 'Tak' : 'Nie'}
+⏰ NextCaseTime: ${user.nextCaseTime ? new Date(user.nextCaseTime).toLocaleString('pl-PL') : 'Brak'}
       `.trim();
     }
   } catch (e) {
@@ -1694,34 +1707,37 @@ ${userInfo}
   `.trim(), { parse_mode: 'Markdown' });
 });
 
-bot.command('checkstatus', (ctx) => {
+bot.command('checkstatus', async (ctx) => {
   const userId = ctx.from.id.toString();
   const session = activeSessions.get(userId);
-  const tracker = autoOpenNotificationTracker.get(userId);
+  const user = await loadUser(userId);
 
-  if (!session) {
-    ctx.reply('❌ Nie jesteś zalogowany');
+  const isAutoOpen = session?.autoOpenEnabled || user?.autoOpenEnabled;
+  const nextTime = session?.nextCaseTime || user?.nextCaseTime;
+
+  if (!isAutoOpen) {
+    ctx.reply('⚠️ AutoOpen nie jest włączony\n\nUżyj /autoopen aby uruchomić Smart Scheduler');
     return;
   }
 
-  if (!session.autoOpenTimeout) {
-    ctx.reply('⚠️ AutoOpen nie jest włączony\n\nUżyj /autoopen aby uruchomić');
-    return;
-  }
+  let statusText = '✅ Smart Scheduler (AutoOpen) jest aktywny\n\n';
+  statusText += '⏱️ Tryb: Inteligentny harmonogram w tle\n';
+  statusText += '🎁 Auto otwieranie: Włączone\n';
+  statusText += '🔄 Samoczynna kontynuacja: Tak (24/7)\n';
 
-  let statusText = '✅ AutoOpen aktywny (smart scheduler)\n\n';
-  statusText += '⏱️ Sprawdzanie: inteligentne (tylko gdy potrzebne)\n';
-  statusText += '🎁 Auto otwieranie: włączone\n';
-  statusText += '🔄 Kontynuacja: tak\n';
+  if (nextTime && nextTime > Date.now()) {
+    const remainingMs = nextTime - Date.now();
+    const timeFormatted = formatTimeMs(remainingMs);
+    const minutesLeft = Math.ceil(remainingMs / 60000);
+    const targetDate = new Date(nextTime).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit' });
 
-  if (tracker && tracker.lastBlockTime) {
-    statusText += `\n⏰ Ostatni czas blokady: ${tracker.lastBlockTime}\n`;
-    const timeSinceNotif = Math.floor((Date.now() - tracker.lastNotificationTime) / (60 * 1000));
-    statusText += `💬 Ostatnie powiadomienie: ${timeSinceNotif} min temu`;
+    statusText += `\n⏰ Czas do skrzynki: ${timeFormatted} (~${minutesLeft} min)\n`;
+    statusText += `🔔 Planowane automatyczne otwarcie: godz. ${targetDate}`;
+  } else {
+    statusText += '\n⏰ Status: Gotowy do otwarcia!';
   }
 
   statusText += '\n\nUżyj /stop aby zatrzymać';
-
   ctx.reply(statusText);
 });
 
@@ -1744,7 +1760,7 @@ bot.hears(/^PIN:(\d{4})$/, async (ctx) => {
   user.familyViewPin = pin;
   await saveUser(user);
 
-  ctx.deleteMessage();
+  ctx.deleteMessage().catch(() => {});
   logger.info(`🔐 [${userId}] Family View PIN zapisany: ${pin}`);
   ctx.reply('✅ PIN Family View zapisany bezpiecznie!');
 });
@@ -1774,7 +1790,7 @@ bot.hears(/^([^:]+):(.+)$/, async (ctx) => {
   user.steamPassword = password;
   await saveUser(user);
 
-  ctx.deleteMessage();
+  ctx.deleteMessage().catch(() => {});
   logger.info(`🔐 [${userId}] Dane Steam zapisane`);
   ctx.reply('✅ Dane Steam zapisane bezpiecznie!');
 });
@@ -1793,14 +1809,11 @@ bot.action('login_password', async (ctx) => {
   try {
     await ctx.answerCbQuery();
   } catch (e) {
-    logger.warn(`⚠️ Nie można odpowiedzieć na callback query: ${e.message}`);
     return;
   }
   try {
     await ctx.editMessageText('🔄 Logowanie przez login i hasło...');
-  } catch (e) {
-    logger.warn(`⚠️ Nie można edytować wiadomości: ${e.message}`);
-  }
+  } catch (e) {}
   await loginToSteam(ctx, 'password');
 });
 
@@ -1808,50 +1821,37 @@ bot.action('login_qr', async (ctx) => {
   try {
     await ctx.answerCbQuery();
   } catch (e) {
-    logger.warn(`⚠️ Nie można odpowiedzieć na callback query: ${e.message}`);
     return;
   }
   try {
     await ctx.editMessageText('🔄 Logowanie przez QR code...');
-  } catch (e) {
-    logger.warn(`⚠️ Nie można edytować wiadomości: ${e.message}`);
-  }
+  } catch (e) {}
   await loginToSteam(ctx, 'qr');
 });
 
 bot.command('check', checkDailyCase);
 bot.command('open', openDailyCase);
-
-bot.command('autoopen', (ctx) => {
-  startAutoOpen(ctx, 5);
-});
-
+bot.command('autoopen', startAutoOpen);
 bot.command('stop', stopAutoOpen);
 
 bot.command('close', async (ctx) => {
   const userId = ctx.from.id.toString();
   const session = activeSessions.get(userId);
 
-  if (session) {
-    if (session.autoOpenTimeout) {
-      clearTimeout(session.autoOpenTimeout);
-      logger.info(`⏹️ [${userId}] AutoOpen zatrzymany przy close`);
+  if (session?.browser) {
+    try {
+      await session.browser.close();
+      logger.info(`🚪 [${userId}] Przeglądarka zamknięta ręcznie`);
+    } catch (e) {
+      logger.error(`⚠️ [${userId}] Błąd zamykania przeglądarki:`, e.message);
     }
+    session.browser = null;
+    session.page = null;
+    setSessionAndTrack(userId, session);
 
-    if (session.browser) {
-      try {
-        await session.browser.close();
-        logger.info(`🚪 [${userId}] Przeglądarka zamknięta (bez usunięcia cookies)`);
-      } catch (e) {
-        logger.error(`⚠️ [${userId}] Błąd zamykania przeglądarki:`, e.message);
-      }
-    }
-
-    activeSessions.delete(userId);
-
-    ctx.reply('🚪 Okienko przeglądarki zostało zamknięte. Sesja cookies została zachowana.');
+    ctx.reply('🚪 Okienko przeglądarki zostało zamknięte.\nSesja i harmonogram AutoOpen działają nadal w tle.');
   } else {
-    ctx.reply('⚠️ Nie masz otwartej sesji przeglądarki');
+    ctx.reply('ℹ️ Przeglądarka jest już uśpiona/zamknięta w tle.');
   }
 });
 
@@ -1875,11 +1875,14 @@ bot.command('logout', async (ctx) => {
     }
 
     activeSessions.delete(userId);
+    sessionCreationTime.delete(userId);
+    autoOpenLocks.delete(userId);
+    lastWatchdogLogTime.delete(userId);
 
     await Session.deleteOne({ telegramId: userId });
     await User.findOneAndUpdate({ telegramId: userId }, { autoOpenEnabled: false, nextCaseTime: null }).catch(() => {});
 
-    ctx.reply('👋 Wylogowano i zamknięto sesję');
+    ctx.reply('👋 Wylogowano i usunięto sesję.');
   } else {
     ctx.reply('⚠️ Nie jesteś zalogowany');
   }
@@ -1893,14 +1896,11 @@ bot.command('resetall', async (ctx) => {
     try {
       if (session.autoOpenTimeout) {
         clearTimeout(session.autoOpenTimeout);
-        logger.info(`⏹️ [${userId}] AutoOpen zatrzymany przy reset`);
       }
 
       if (session.browser) {
         await session.browser.close();
-        logger.info(`🚪 [${userId}] Przeglądarka zamknięta przy reset`);
       }
-
       closedCount++;
     } catch (e) {
       logger.error(`⚠️ [${userId}] Błąd zamykania przeglądarki przy reset:`, e.message);
@@ -1908,6 +1908,9 @@ bot.command('resetall', async (ctx) => {
   }
 
   activeSessions.clear();
+  sessionCreationTime.clear();
+  autoOpenLocks.clear();
+  lastWatchdogLogTime.clear();
 
   try {
     await Session.deleteMany({});
@@ -1917,72 +1920,47 @@ bot.command('resetall', async (ctx) => {
     logger.error('⚠️ Błąd usuwania sesji z bazy:', e.message);
   }
 
-  await ctx.reply(`🔄 Reset zakończony!\nZamknięto ${closedCount} aktywnych sesji.\nWszystkie dane wyczyszczone.\nBot gotowy do nowego startu.`);
+  await ctx.reply(`🔄 Reset zakończony!\nZamknięto ${closedCount} aktywnych sesji.\nWszystkie dane wyczyszczone.`);
   logger.info(`✅ [RESETALL] Reset zakończony - zamknięto ${closedCount} sesji`);
 });
 
-bot.command('status', (ctx) => {
+bot.command('status', async (ctx) => {
   const userId = ctx.from.id.toString();
   const session = activeSessions.get(userId);
+  const user = await loadUser(userId);
 
-  if (!session) {
-    ctx.reply('❌ Nie jesteś zalogowany');
+  if (!session && !user) {
+    ctx.reply('❌ Nie jesteś zarejestrowany');
     return;
   }
 
-  const browserStatus = session.browser && session.browser.isConnected() ? '✅ Aktywna' : '❌ Zamknięta';
+  const browserStatus = session?.browser && session.browser.isConnected() ? '✅ Aktywna' : '💤 Uśpiona w tle';
+  const isAutoOpen = session?.autoOpenEnabled || user?.autoOpenEnabled;
+  const nextTime = session?.nextCaseTime || user?.nextCaseTime;
+
+  let autoOpenStr = '❌ Wyłączony';
+  if (isAutoOpen) {
+    if (nextTime && nextTime > Date.now()) {
+      const mins = Math.ceil((nextTime - Date.now()) / 60000);
+      const targetTimeStr = new Date(nextTime).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit' });
+      autoOpenStr = `✅ Włączony (otwarcie o ${targetTimeStr}, za ~${mins} min)`;
+    } else {
+      autoOpenStr = '✅ Włączony (oczekiwanie na sprawdzenie)';
+    }
+  }
 
   const status =
     `📊 Status sesji:\n\n` +
-    `✅ Zalogowany: ${session.isLoggedIn ? 'Tak' : 'Nie'}\n` +
-    `🔐 Metoda: ${session.loginMethod || 'Brak'}\n` +
+    `✅ Zalogowany: ${(session?.isLoggedIn || user?.steamUsername) ? 'Tak' : 'Nie'}\n` +
+    `🔐 Metoda: ${session?.loginMethod || (user?.steamUsername ? 'Steam credentials' : 'Brak')}\n` +
     `🌐 Przeglądarka: ${browserStatus}\n` +
-    `🔄 AutoOpen: ${session.autoOpenTimeout ? 'Włączony' : 'Wyłączony'}`;
+    `🔄 AutoOpen: ${autoOpenStr}`;
 
   ctx.reply(status);
 });
 
-// ====== PRZYWRACANIE AUTOOPEN PO RESTARCIE SERWERA ======
-async function restoreAutoOpenTasks() {
-  try {
-    const users = await User.find({ autoOpenEnabled: true });
-    if (users.length === 0) return;
+// ====== START APLIKACJI ======
 
-    logger.info(`🔄 Przywracanie AutoOpen dla ${users.length} użytkowników...`);
-
-    for (const user of users) {
-      const userId = user.telegramId;
-      const now = Date.now();
-
-      let delay = user.nextCaseTime ? (user.nextCaseTime - now) : 10000;
-      if (delay < 0) {
-        delay = 10000 + Math.floor(Math.random() * 20000);
-      }
-
-      activeSessions.set(userId, { isLoggedIn: true });
-
-      const mockCtx = {
-        from: { id: parseInt(userId) },
-        isSilent: true,
-        reply: async (text) => {
-          try {
-            await bot.telegram.sendMessage(userId, text);
-          } catch(e) {
-            logger.warn(`⚠️ Nie można wysłać wiadomości przywracania do ${userId}`);
-          }
-        }
-      };
-
-      logger.info(`⏰ [${userId}] AutoOpen przywrócony - sprawdzenie nastąpi za ~${Math.round(delay / 60000)} min`);
-
-      startAutoOpen(mockCtx, 10, delay);
-    }
-  } catch (e) {
-    logger.error('❌ Błąd podczas przywracania AutoOpen z bazy danych:', e.message);
-  }
-}
-
-// URUCHOMIENIE - NAJPIERW MONGODB, POTEM BOT
 async function startBot() {
   logger.info('🚀 Uruchamiam bota...');
 
@@ -1994,13 +1972,13 @@ async function startBot() {
     process.exit(1);
   }
 
-  await bot.telegram.setMyCommands(commands);
+  await bot.telegram.setMyCommands(commands).catch(() => {});
   await bot.telegram.setChatMenuButton({
     menu_button: {
       type: 'commands',
       text: 'Menu'
     }
-  });
+  }).catch(() => {});
 
   logger.info('🤖 MongoDB połączony - uruchamiam bota Telegram...');
 
@@ -2009,7 +1987,8 @@ async function startBot() {
     logger.info('✅ Bot uruchomiony pomyślnie!');
     logger.info('🎯 Bot gotowy do pracy - wyślij /start w Telegramie');
 
-    // Przywróć zadania AutoOpen zapisane w bazie
+    // Uruchom Watchdog i przywróć zadania AutoOpen z MongoDB
+    startAutoOpenWatchdog();
     await restoreAutoOpenTasks();
 
     if (!isProduction) {
@@ -2043,9 +2022,7 @@ process.once('SIGINT', async () => {
     if (session.browser) {
       try {
         await session.browser.close();
-      } catch (e) {
-        logger.error(`Błąd zamykania przeglądarki [${userId}]:`, e.message);
-      }
+      } catch (e) {}
     }
   }
   bot.stop('SIGINT');
@@ -2059,9 +2036,7 @@ process.once('SIGTERM', async () => {
     if (session.browser) {
       try {
         await session.browser.close();
-      } catch (e) {
-        logger.error(`Błąd zamykania przeglądarki [${userId}]:`, e.message);
-      }
+      } catch (e) {}
     }
   }
   bot.stop('SIGTERM');

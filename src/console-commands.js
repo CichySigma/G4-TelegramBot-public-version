@@ -111,7 +111,6 @@ class ConsoleCommands {
 
     this.rl.on('close', () => {
       console.log('\n\x1b[36m%s\x1b[0m', 'Zamykam konsolę testową...');
-      // Nie zamykaj procesu - bot nadal działa
     });
   }
 
@@ -170,7 +169,6 @@ class ConsoleCommands {
         break;
 
       default:
-        // Sprawdź czy to komenda bota (zaczyna się od /)
         if (input.startsWith('/')) {
           const cmdParts = input.split(' ');
           const botCommand = cmdParts[0];
@@ -198,7 +196,6 @@ class ConsoleCommands {
     const ctx = this.createMockContext(userId, command);
 
     try {
-      // Mapowanie komend na funkcje
       switch (command) {
         case '/start':
           await ctx.reply('👋 Witaj! Bot G4Skins Daily Case.\n\n' +
@@ -207,7 +204,7 @@ class ConsoleCommands {
             '/login - zaloguj się\n' +
             '/check - sprawdź daily case\n' +
             '/open - otwórz daily case\n' +
-            '/autoopen - włącz/wyłącz automatyczne otwieranie\n' +
+            '/autoopen - włącz automatyczne otwieranie (smart scheduler)\n' +
             '/status - sprawdź status\n' +
             '/logout - wyloguj się');
           break;
@@ -221,7 +218,6 @@ class ConsoleCommands {
           break;
 
         case '/login':
-          // Sprawdź czy użytkownik ma zapisane dane
           const user = await this.loadUser(userId);
           if (user && user.steamUsername && user.steamPassword) {
             await ctx.reply('🔄 Automatyczne logowanie z zapisanych danych...');
@@ -249,7 +245,7 @@ class ConsoleCommands {
             await ctx.reply(`👤 Twoje dane:\n` +
               `- Username: ${userData.steamUsername ? '✅' : '❌'}\n` +
               `- Password: ${userData.steamPassword ? '✅' : '❌'}\n` +
-              `- PIN: ${userData.pin ? '✅' : '❌'}`);
+              `- PIN: ${userData.familyViewPin ? '✅' : '❌'}`);
           } else {
             await ctx.reply('❌ Brak zapisanych danych');
           }
@@ -258,112 +254,74 @@ class ConsoleCommands {
         default:
           await ctx.reply(`❌ Nieznana komenda: ${command}`);
       }
-
-      const messages = ctx.getMessages();
-      console.log(`✅ Komenda wykonana, wysłano ${messages.length} wiadomości\n`);
-
     } catch (error) {
-      console.error('\x1b[31m%s\x1b[0m', `❌ Błąd wykonania: ${error.message}`);
-      logger.error(`Console simulation error for ${userId}:`, error);
+      console.error('\x1b[31m%s\x1b[0m', `❌ Błąd wykonania komendy: ${error.message}`);
+      logger.error('Error executing simulated command:', error);
     }
   }
 
-  /**
-   * Pokazuje pomoc
-   */
   showHelp() {
-    console.log('\n\x1b[36m%s\x1b[0m', '=== POMOC ===');
-    console.log('\nKomendy systemowe:');
-    console.log('  setuser <userId>  - Ustaw domyślny userId (np. setuser 961312609)');
-    console.log('  user              - Pokaż info o użytkowniku');
-    console.log('  sessions          - Lista aktywnych sesji');
-    console.log('  log [n]           - Ostatnie n wiadomości');
-    console.log('  clear             - Wyczyść log');
-    console.log('  exit              - Wyjdź');
-
-    console.log('\nKomendy bota (wymagają userId):');
-    console.log('  /check [userId]   - Sprawdź daily case');
-    console.log('  /open [userId]    - Otwórz daily case');
-    console.log('  /login [userId]   - Zaloguj użytkownika');
-    console.log('  /sessions [userId]- Status sesji');
-    console.log('  /user [userId]    - Dane użytkownika');
-
-    console.log('\nPrzykłady:');
-    console.log('  setuser 961312609');
-    console.log('  /check            (użyje domyślnego userId)');
-    console.log('  /open 961312609   (użyje podanego userId)');
-    console.log('  simulate 961312609 /check');
-    console.log('');
+    console.log('\n\x1b[36m%s\x1b[0m', 'Dostępne komendy konsolowe:');
+    console.log('  help                    - Pokaż tę pomoc');
+    console.log('  setuser <userId>        - Ustaw domyślny telegramId dla komend');
+    console.log('  user                    - Pokaż dane aktualnie wybranego użytkownika');
+    console.log('  sessions                - Pokaż wszystkie aktywne sesje w pamięci');
+    console.log('  /check [userId]         - Sprawdź status skrzynki');
+    console.log('  /open [userId]          - Otwórz skrzynkę');
+    console.log('  /login [userId]         - Zaloguj użytkownika');
+    console.log('  log [n]                 - Pokaż ostatnie n wiadomości (domyślnie 10)');
+    console.log('  clear                   - Wyczyść historię wiadomości');
+    console.log('  exit                    - Wyjdź z konsoli testowej\n');
   }
 
-  /**
-   * Pokazuje informacje o aktualnym użytkowniku
-   */
   async showUserInfo() {
     if (!this.defaultUserId) {
-      console.log('❌ Brak ustawionego domyślnego userId. Użyj: setuser <userId>');
+      console.log('❌ Nie ustawiono domyślnego użytkownika! Użyj: setuser <userId>');
       return;
     }
 
-    console.log(`\n👤 Informacje o użytkowniku: ${this.defaultUserId}`);
-
     const user = await this.loadUser(this.defaultUserId);
     if (user) {
-      console.log('  Steam Username:', user.steamUsername ? '✅ Zapisany' : '❌ Brak');
-      console.log('  Steam Password:', user.steamPassword ? '✅ Zapisany' : '❌ Brak');
-      console.log('  PIN:', user.pin ? '✅ Zapisany' : '❌ Brak');
+      console.log('\n\x1b[36m%s\x1b[0m', `Dane użytkownika ${this.defaultUserId}:`);
+      console.log(`  Username: ${user.steamUsername || 'BRAK'}`);
+      console.log(`  Password: ${user.steamPassword ? '*** (zapisane)' : 'BRAK'}`);
+      console.log(`  PIN:      ${user.familyViewPin || 'BRAK'}`);
+      console.log(`  AutoOpen: ${user.autoOpenEnabled ? 'TAK' : 'NIE'}`);
+      console.log(`  NextCase: ${user.nextCaseTime ? new Date(user.nextCaseTime).toLocaleString('pl-PL') : 'Brak'}\n`);
     } else {
-      console.log('  ❌ Brak zapisanych danych');
+      console.log(`❌ Użytkownik ${this.defaultUserId} nie istnieje w bazie.`);
     }
-
-    const session = this.activeSessions.get(this.defaultUserId);
-    if (session) {
-      console.log('\n  📱 Aktywna sesja:');
-      console.log('    Zalogowany:', session.isLoggedIn ? '✅ TAK' : '❌ NIE');
-      console.log('    Przeglądarka:', session.browser?.isConnected() ? '✅ Aktywna' : '❌ Nieaktywna');
-      console.log('    AutoOpen:', session.autoOpenEnabled ? '✅ Włączony' : '❌ Wyłączony');
-    } else {
-      console.log('\n  ❌ Brak aktywnej sesji');
-    }
-    console.log('');
   }
 
-  /**
-   * Pokazuje aktywne sesje
-   */
   showSessions() {
-    console.log(`\n📱 Aktywne sesje: ${this.activeSessions.size}`);
-
+    console.log('\n\x1b[36m%s\x1b[0m', `Aktywne sesje (${this.activeSessions.size}):`);
     if (this.activeSessions.size === 0) {
-      console.log('  (brak aktywnych sesji)');
-    } else {
-      for (const [userId, session] of this.activeSessions.entries()) {
-        console.log(`\n  User ${userId}:`);
-        console.log(`    Zalogowany: ${session.isLoggedIn ? '✅' : '❌'}`);
-        console.log(`    Przeglądarka: ${session.browser?.isConnected() ? '✅ Aktywna' : '❌ Nieaktywna'}`);
-        console.log(`    AutoOpen: ${session.autoOpenEnabled ? '✅' : '❌'}`);
-      }
+      console.log('  Brak aktywnych sesji w pamięci.');
+      return;
+    }
+
+    for (const [userId, session] of this.activeSessions.entries()) {
+      const browserStatus = session.browser?.isConnected() ? 'Aktywna' : 'Uśpiona/Zamknięta';
+      console.log(`  [${userId}]:`);
+      console.log(`    Zalogowany:   ${session.isLoggedIn ? 'TAK' : 'NIE'}`);
+      console.log(`    Przeglądarka: ${browserStatus}`);
+      console.log(`    AutoOpen:     ${session.autoOpenEnabled ? 'WŁĄCZONY' : 'WYŁĄCZONY'}`);
     }
     console.log('');
   }
 
-  /**
-   * Pokazuje log wiadomości
-   */
   showLog(count = 10) {
-    const recent = this.messageLog.slice(-count);
+    console.log('\n\x1b[36m%s\x1b[0m', `Ostatnie ${count} wiadomości:`);
+    const logs = this.messageLog.slice(-count);
+    if (logs.length === 0) {
+      console.log('  Brak wiadomości w historii.');
+      return;
+    }
 
-    console.log(`\n📝 Ostatnie ${recent.length} wiadomości:\n`);
-
-    if (recent.length === 0) {
-      console.log('  (brak wiadomości)');
-    } else {
-      recent.forEach(msg => {
-        const time = msg.timestamp.toLocaleTimeString();
-        const color = msg.type === 'user' ? '\x1b[33m' : '\x1b[32m';
-        const prefix = msg.type === 'user' ? 'USER' : 'BOT';
-        console.log(`${color}[${time}] [${msg.userId}] ${prefix}: ${msg.text}\x1b[0m`);
-      });
+    for (const log of logs) {
+      const time = log.timestamp.toLocaleTimeString();
+      const color = log.type === 'bot' ? '\x1b[32m' : '\x1b[33m';
+      console.log(`${color}[${time}] [${log.userId}] ${log.type.toUpperCase()}: ${log.text}\x1b[0m`);
     }
     console.log('');
   }
