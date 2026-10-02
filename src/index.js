@@ -457,7 +457,7 @@ async function loginToSteam(ctx, loginMethod = 'password') {
 
     const { page } = session;
 
-    if (!ctx.isSilent) await ctx.reply('🔄 Rozpoczynam logowanie...');
+    
     await page.goto(CONFIG.URLS.G4SKINS_DAILY, { waitUntil: 'networkidle2' });
 
     try {
@@ -468,7 +468,7 @@ async function loginToSteam(ctx, loginMethod = 'password') {
       });
 
       if (alreadyLoggedIn) {
-        if (!ctx.isSilent) await ctx.reply('✅ Już jesteś zalogowany!');
+        if (!ctx.isSilent) await ctx.reply('✅ Jesteś zalogowany.');
         session.isLoggedIn = true;
         setSessionAndTrack(userId, session);
         return true;
@@ -476,7 +476,7 @@ async function loginToSteam(ctx, loginMethod = 'password') {
       await new Promise(resolve => setTimeout(resolve, 2000));
     }
 
-    if (!ctx.isSilent) await ctx.reply('☑️ Zaznaczam checkboxy...');
+    
 
     await page.waitForSelector(SELECTORS.g4skins.checkbox, { timeout: 5000 }).catch(() => {});
     await new Promise(resolve => setTimeout(resolve, 1500));
@@ -506,7 +506,7 @@ async function loginToSteam(ctx, loginMethod = 'password') {
     logger.info(`[${userId}] Checkboxy kliknięte: ${clickedCount}/${checkboxes.length}`);
     await new Promise(resolve => setTimeout(resolve, 2000));
 
-    if (!ctx.isSilent) await ctx.reply('🎮 Przechodzę do Steam...');
+    
 
     await page.waitForFunction(
       () => {
@@ -557,7 +557,7 @@ async function handlePasswordLogin(ctx, page, userId) {
     throw new Error('Brak danych Steam');
   }
 
-  if (!ctx.isSilent) await ctx.reply('🔑 Wpisuję dane logowania...');
+  
 
   const usernameSelector = await findElement(page, SELECTORS.steam.usernameInput);
   await page.click(usernameSelector);
@@ -816,7 +816,7 @@ async function handleFamilyView(ctx, page, userId) {
 }
 
 async function waitForRedirectOrGuard(ctx, page, userId) {
-  if (!ctx.isSilent) await ctx.reply('⏳ Czekam na zalogowanie (max 2 minuty)...');
+  
 
   const maxWaitTime = 120000;
   const startTime = Date.now();
@@ -974,7 +974,7 @@ async function waitForRedirectOrGuard(ctx, page, userId) {
       setSessionAndTrack(userId, session);
 
       logger.info(`✅ [${userId}] Zalogowano pomyślnie`);
-      if (!ctx.isSilent) await ctx.reply('✅ Zalogowano pomyślnie! Sesja zapisana.');
+      if (!ctx.isSilent) await ctx.reply('✅ Zalogowano.');
       return true;
     } else {
       if (!ctx.isSilent) await ctx.reply('⚠️ Logowanie nie powiodło się. Spróbuj ponownie /login');
@@ -1189,7 +1189,7 @@ async function checkDailyCase(ctx) {
       return { found: true, blocked: true, time: caseInfo.time, timeFormatted, timeMs };
     }
 
-    if (!ctx.isSilent) await ctx.reply('✅ Daily case jest dostępny!');
+    
     logger.info(`✅ [${userId}] Daily case dostępny do otwarcia`);
     return { found: true, blocked: false };
 
@@ -1215,7 +1215,7 @@ async function openDailyCase(ctx) {
     await page.goto(CONFIG.URLS.G4SKINS_DAILY, { waitUntil: 'networkidle2', timeout: 30000 });
     logger.info(`📦 [${userId}] Przygotowuję do otwarcia daily case...`);
 
-    if (!ctx.isSilent) await ctx.reply('📦 Sprawdzam ekwipunek przed otwarciem...');
+    
 
     const inventoryBefore = await page.evaluate(async (apiUrl) => {
       try {
@@ -1282,7 +1282,7 @@ async function openDailyCase(ctx) {
       return false;
     }
 
-    if (!ctx.isSilent) await ctx.reply('🎁 Otwieranie daily case...');
+    
     logger.info(`🎁 [${userId}] Otwarto daily case, czekam na zatwierdzenie dropu...`);
 
     await new Promise(resolve => setTimeout(resolve, 4000));
@@ -1319,15 +1319,50 @@ async function openDailyCase(ctx) {
     }
 
     if (newItems.length === 0) {
-      await bot.telegram.sendMessage(userId, '🎲 Dostałeś prawdopodobnie skrzynię lub EXP (sprawdź historię dropów na stronie)');
-      logger.info(`🎲 [${userId}] Brak nowych skinów (prawdopodobnie EXP lub skrzynka)`);
+      const notification = await page.evaluate(() => {
+        const notifElement = document.querySelector('.notifications__list-element .notification-element');
+        if (!notifElement) return null;
+        
+        const description = notifElement.querySelector('.notification-element__info-description');
+        const img = notifElement.querySelector('.notification-element__image-img');
+        
+        if (description && description.textContent.includes('EXP')) {
+            return { type: 'EXP', text: description.textContent.trim() };
+        }
+        
+        if (description && img) {
+            return {
+                type: 'CASE',
+                text: description.textContent.trim(),
+                name: description.querySelector('b') ? description.querySelector('b').textContent.trim() : description.textContent.trim(),
+                imgUrl: img.src
+            };
+        }
+        
+        return null;
+      });
+
+      if (notification && notification.type === 'CASE') {
+          if (!ctx.isSilent) {
+              await bot.telegram.sendPhoto(userId, notification.imgUrl, {
+                  caption: `🎁 Otrzymałeś z Daily Case:\n\n📦 ${notification.name}`
+              });
+          }
+          logger.info(`✅ [${userId}] Otrzymano darmową skrzynkę: ${notification.name}`);
+      } else if (notification && notification.type === 'EXP') {
+          if (!ctx.isSilent) await bot.telegram.sendMessage(userId, `🎁 Otrzymałeś z Daily Case:\n\n✨ ${notification.text}`);
+          logger.info(`✅ [${userId}] Otrzymano EXP: ${notification.text}`);
+      } else {
+          if (!ctx.isSilent) await bot.telegram.sendMessage(userId, '❓ Dostałeś skrzynię lub EXP.');
+          logger.info(`❓ [${userId}] Brak nowych skinów (EXP lub skrzynka)`);
+      }
     } else {
       const skinsWithValue = newItems.map(item =>
         `✨ ${item.name} (${(item.value * 4).toFixed(2)} zł)`
       ).join('\n');
 
-      await bot.telegram.sendMessage(userId, `🎁 Otrzymałeś z Daily Case:\n\n${skinsWithValue}`);
-      logger.info(`✨ [${userId}] Nowe itemy: ${newItems.length} (${newItems.map(i => i.name).join(', ')})`);
+      if (!ctx.isSilent) await bot.telegram.sendMessage(userId, `🎁 Otrzymałeś z Daily Case:\n\n${skinsWithValue}`);
+      logger.info(`✅ [${userId}] Nowe itemy: ${newItems.length} (${newItems.map(i => i.name).join(', ')})`);
     }
 
     // Odczytaj nowy timer ze strony po otwarciu
@@ -1479,7 +1514,7 @@ async function runAutoOpenCheck(userId, isManual = false) {
         nextDelay = openResult.newCooldownMs + 5000;
       }
 
-      const nextHours = (nextDelay / 3600000).toFixed(1);
+      const nextHours = (nextDelay / 360000).toFixed(1);
       const nextTargetTime = new Date(Date.now() + nextDelay).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit' });
 
       // Zwalniamy RAM
