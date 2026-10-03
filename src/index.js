@@ -457,7 +457,7 @@ async function loginToSteam(ctx, loginMethod = 'password') {
 
     const { page } = session;
 
-    
+
     await page.goto(CONFIG.URLS.G4SKINS_DAILY, { waitUntil: 'networkidle2' });
 
     try {
@@ -476,7 +476,7 @@ async function loginToSteam(ctx, loginMethod = 'password') {
       await new Promise(resolve => setTimeout(resolve, 2000));
     }
 
-    
+
 
     await page.waitForSelector(SELECTORS.g4skins.checkbox, { timeout: 5000 }).catch(() => {});
     await new Promise(resolve => setTimeout(resolve, 1500));
@@ -506,7 +506,7 @@ async function loginToSteam(ctx, loginMethod = 'password') {
     logger.info(`[${userId}] Checkboxy kliknięte: ${clickedCount}/${checkboxes.length}`);
     await new Promise(resolve => setTimeout(resolve, 2000));
 
-    
+
 
     await page.waitForFunction(
       () => {
@@ -557,7 +557,7 @@ async function handlePasswordLogin(ctx, page, userId) {
     throw new Error('Brak danych Steam');
   }
 
-  
+
 
   const usernameSelector = await findElement(page, SELECTORS.steam.usernameInput);
   await page.click(usernameSelector);
@@ -816,7 +816,7 @@ async function handleFamilyView(ctx, page, userId) {
 }
 
 async function waitForRedirectOrGuard(ctx, page, userId) {
-  
+
 
   const maxWaitTime = 120000;
   const startTime = Date.now();
@@ -1189,7 +1189,7 @@ async function checkDailyCase(ctx) {
       return { found: true, blocked: true, time: caseInfo.time, timeFormatted, timeMs };
     }
 
-    
+
     logger.info(`✅ [${userId}] Daily case dostępny do otwarcia`);
     return { found: true, blocked: false };
 
@@ -1215,7 +1215,7 @@ async function openDailyCase(ctx) {
     await page.goto(CONFIG.URLS.G4SKINS_DAILY, { waitUntil: 'networkidle2', timeout: 30000 });
     logger.info(`📦 [${userId}] Przygotowuję do otwarcia daily case...`);
 
-    
+
 
     const inventoryBefore = await page.evaluate(async (apiUrl) => {
       try {
@@ -1282,7 +1282,7 @@ async function openDailyCase(ctx) {
       return false;
     }
 
-    
+
     logger.info(`🎁 [${userId}] Otwarto daily case, czekam na zatwierdzenie dropu...`);
 
     await new Promise(resolve => setTimeout(resolve, 4000));
@@ -1322,14 +1322,14 @@ async function openDailyCase(ctx) {
       const notification = await page.evaluate(() => {
         const notifElement = document.querySelector('.notifications__list-element .notification-element');
         if (!notifElement) return null;
-        
+
         const description = notifElement.querySelector('.notification-element__info-description');
         const img = notifElement.querySelector('.notification-element__image-img');
-        
+
         if (description && description.textContent.includes('EXP')) {
             return { type: 'EXP', text: description.textContent.trim() };
         }
-        
+
         if (description && img) {
             return {
                 type: 'CASE',
@@ -1338,22 +1338,20 @@ async function openDailyCase(ctx) {
                 imgUrl: img.src
             };
         }
-        
+
         return null;
       });
 
       if (notification && notification.type === 'CASE') {
-          if (!ctx.isSilent) {
-              await bot.telegram.sendPhoto(userId, notification.imgUrl, {
-                  caption: `🎁 Otrzymałeś z Daily Case:\n\n📦 ${notification.name}`
-              });
-          }
+          await bot.telegram.sendPhoto(userId, notification.imgUrl, {
+              caption: `🎁 Otrzymałeś z Daily Case:\n\n📦 ${notification.name}`
+          });
           logger.info(`✅ [${userId}] Otrzymano darmową skrzynkę: ${notification.name}`);
       } else if (notification && notification.type === 'EXP') {
-          if (!ctx.isSilent) await bot.telegram.sendMessage(userId, `🎁 Otrzymałeś z Daily Case:\n\n✨ ${notification.text}`);
+          await bot.telegram.sendMessage(userId, `🎁 Otrzymałeś z Daily Case:\n\n✨ ${notification.text}`);
           logger.info(`✅ [${userId}] Otrzymano EXP: ${notification.text}`);
       } else {
-          if (!ctx.isSilent) await bot.telegram.sendMessage(userId, '❓ Dostałeś skrzynię lub EXP.');
+          await bot.telegram.sendMessage(userId, '❓ Dostałeś skrzynię lub EXP.');
           logger.info(`❓ [${userId}] Brak nowych skinów (EXP lub skrzynka)`);
       }
     } else {
@@ -1361,7 +1359,7 @@ async function openDailyCase(ctx) {
         `✨ ${item.name} (${(item.value * 4).toFixed(2)} zł)`
       ).join('\n');
 
-      if (!ctx.isSilent) await bot.telegram.sendMessage(userId, `🎁 Otrzymałeś z Daily Case:\n\n${skinsWithValue}`);
+      await bot.telegram.sendMessage(userId, `🎁 Otrzymałeś z Daily Case:\n\n${skinsWithValue}`);
       logger.info(`✅ [${userId}] Nowe itemy: ${newItems.length} (${newItems.map(i => i.name).join(', ')})`);
     }
 
@@ -1378,10 +1376,40 @@ async function openDailyCase(ctx) {
     });
 
     let newCooldownMs = null;
-    if (newTimerText) {
-      newCooldownMs = parseTimeToMs(newTimerText);
-      logger.info(`⏱️ [${userId}] Nowy cooldown odczytany ze strony: ${newTimerText} (${formatTimeMs(newCooldownMs)})`);
-    }
+      if (newTimerText) {
+        newCooldownMs = parseTimeToMs(newTimerText);
+        logger.info(`⏱️ [${userId}] Nowy cooldown wstępnie: ${newTimerText} (${formatTimeMs(newCooldownMs)})`);
+      }
+      
+      // Jeśli czas to np. 5 minut, to prawdopodobnie błąd animacji / strony. Odświeżamy i sprawdzamy ponownie.
+      if (!newCooldownMs || newCooldownMs < 3600000) { // Mniej niż godzina
+          try {
+              logger.info(`🔄 [${userId}] Wstępny czas to < 1h. Odświeżam stronę by uzyskać dokładny cooldown...`);
+              await page.reload({ waitUntil: 'networkidle2', timeout: 15000 });
+              await new Promise(resolve => setTimeout(resolve, 3000));
+              const realTimerText = await page.evaluate(() => {
+                const container = document.querySelector('.top-options');
+                const btn = container ? container.querySelector('.G_Button.big.max') : null;
+                if (btn && btn.classList.contains('block')) {
+                  const timeDiv = btn.querySelector('.button_text');
+                  return timeDiv ? timeDiv.textContent.trim() : null;
+                }
+                return null;
+              });
+              
+              if (realTimerText) {
+                  newCooldownMs = parseTimeToMs(realTimerText);
+                  logger.info(`⏱️ [${userId}] Prawdziwy nowy cooldown ze strony: ${realTimerText} (${formatTimeMs(newCooldownMs)})`);
+              } else {
+                  // Domyślny bezpieczny czas
+                  newCooldownMs = 19 * 3600 * 1000 + 40 * 60 * 1000;
+                  logger.info(`⚠️ [${userId}] Brak timera po odświeżeniu. Ustawiam domyślne 19h 40m.`);
+              }
+          } catch(e) {
+              logger.warn(`⚠️ [${userId}] Błąd podczas odświeżania dla dokładnego cooldownu: ${e.message}`);
+              newCooldownMs = 19 * 3600 * 1000 + 40 * 60 * 1000;
+          }
+      }
 
     return {
       success: true,
@@ -1433,7 +1461,7 @@ function scheduleUserNext(userId, delayMs) {
   ).catch(e => logger.error(`⚠️ [${userId}] Błąd zapisu harmonogramu w bazie:`, e.message));
 
   const minutesLeft = Math.ceil(delayMs / 60000);
-  const targetDateStr = new Date(nextCaseTime).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit' });
+  const targetDateStr = new Date(nextCaseTime).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Warsaw' });
   logger.info(`🗓️ [${userId}] AutoOpen zaplanowany za ~${minutesLeft} min (godz. ${targetDateStr})`);
 }
 
@@ -1482,7 +1510,7 @@ async function runAutoOpenCheck(userId, isManual = false) {
       // Skrzynka zablokowana – wylicz czas + 5 sekund bufora bezpieczeństwa
       const delay = (checkResult.timeMs || parseTimeToMs(checkResult.time)) + 5000;
       const minutesLeft = Math.ceil(delay / 60000);
-      const targetTime = new Date(Date.now() + delay).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit' });
+      const targetTime = new Date(Date.now() + delay).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Warsaw' });
 
       // Natychmiast zwalniamy RAM zamykając przeglądarkę
       await closeBrowserSilently(userId);
@@ -1514,8 +1542,11 @@ async function runAutoOpenCheck(userId, isManual = false) {
         nextDelay = openResult.newCooldownMs + 5000;
       }
 
-      const nextHours = (nextDelay / 360000).toFixed(1);
-      const nextTargetTime = new Date(Date.now() + nextDelay).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit' });
+      const nextHours = (nextDelay / 3600000).toFixed(1);
+      // Dodajemy 2h do timezone bo toLocaleTimeString wyciąga czas w UTC w Node.js jeśli brakuje lokalnego locale / strefy
+        const targetDate = new Date(Date.now() + nextDelay);
+        // Konwersja bezpieczna do polskiej strefy
+        const nextTargetTime = targetDate.toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Warsaw' });
 
       // Zwalniamy RAM
       await closeBrowserSilently(userId);
@@ -1525,7 +1556,7 @@ async function runAutoOpenCheck(userId, isManual = false) {
 
       await bot.telegram.sendMessage(
         userId,
-        `⏳ Następny daily case za ~${nextHours}h (godz. ${nextTargetTime}).\nSmart Scheduler czuwa w tle!`
+        `⏳ Następny daily case za ~${nextHours}h (godz. ${nextTargetTime}).`
       );
     }
 
@@ -1627,7 +1658,7 @@ function startAutoOpenWatchdog() {
           if (now - lastLog > 10 * 60 * 1000) {
             lastWatchdogLogTime.set(userId, now);
             const minsLeft = Math.ceil(remainingMs / 60000);
-            const targetTimeStr = new Date(nextCaseTime).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit' });
+            const targetTimeStr = new Date(nextCaseTime).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Warsaw' });
             logger.info(`⏱️ [Watchdog] [${userId}] AutoOpen odlicza w tle: pozostało ~${minsLeft} min (otwarcie o ${targetTimeStr})`);
           }
         }
@@ -1765,7 +1796,7 @@ bot.command('checkstatus', async (ctx) => {
     const remainingMs = nextTime - Date.now();
     const timeFormatted = formatTimeMs(remainingMs);
     const minutesLeft = Math.ceil(remainingMs / 60000);
-    const targetDate = new Date(nextTime).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit' });
+    const targetDate = new Date(nextTime).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Warsaw' });
 
     statusText += `\n⏰ Czas do skrzynki: ${timeFormatted} (~${minutesLeft} min)\n`;
     statusText += `🔔 Planowane automatyczne otwarcie: godz. ${targetDate}`;
@@ -1978,7 +2009,7 @@ bot.command('status', async (ctx) => {
   if (isAutoOpen) {
     if (nextTime && nextTime > Date.now()) {
       const mins = Math.ceil((nextTime - Date.now()) / 60000);
-      const targetTimeStr = new Date(nextTime).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit' });
+      const targetTimeStr = new Date(nextTime).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Warsaw' });
       autoOpenStr = `✅ Włączony (otwarcie o ${targetTimeStr}, za ~${mins} min)`;
     } else {
       autoOpenStr = '✅ Włączony (oczekiwanie na sprawdzenie)';
