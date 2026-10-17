@@ -1,0 +1,15 @@
+services:
+  bot:
+    init: true
+    environment:
+      BROWSER_NATIVE: "true"
+      BROWSER_PROFILE_ROOT: /app/browser-profiles
+      DISPLAY: ":99"
+    ports:
+      - "127.0.0.1:6080:6080"
+    volumes:
+      - browser_profiles:/app/browser-profiles
+    stop_grace_period: 30s
+
+volumes:
+  browser_profiles:
