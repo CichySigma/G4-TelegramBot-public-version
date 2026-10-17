@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    container_name: tg_bot
+    restart: unless-stopped
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}
+      MONGODB_URI: ${MONGODB_URI:?Set MONGODB_URI in .env}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    shm_size: "1gb"

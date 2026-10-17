@@ -3,13 +3,15 @@ FROM node:18-slim
 
 # Ustaw zmienne środowiskowe
 ENV NODE_ENV=production
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=false
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_SKIP_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 # Zainstaluj Chromium i zależności
 RUN apt-get update && apt-get install -y \
     chromium \
     chromium-sandbox \
+    xvfb x11vnc novnc websockify \
     fonts-liberation \
     libappindicator3-1 \
     libasound2 \
@@ -47,4 +49,4 @@ COPY . .
 EXPOSE 8080
 
 # Uruchom bota
-CMD ["node", "src/index.js"]
+CMD ["sh", "docker-entrypoint.sh"]

@@ -7,6 +7,11 @@ logs*.json
 # Zmienne środowiskowe
 .env
 .env.*
+!.env.example
+
+# Local deployment configuration and persistent browser sessions
+/docker-compose.yml
+/browser-profiles/
 
 # Lokalny zapis sesji/danych (jeśli używasz tymczasowo plików JSON)
 sessions.json
