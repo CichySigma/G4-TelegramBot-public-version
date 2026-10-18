@@ -20,7 +20,9 @@ Compose automatycznie dołącza `docker-compose.override.yml`. Uruchamia on prze
 
 ## Ręczna weryfikacja strony
 
-G4Skins może zwrócić ekran weryfikacji i HTTP 403. Bot rozpoznaje ten stan i nie zgłasza go jako brak przycisku ani udane logowanie. Automatyzacja nie rozwiązuje CAPTCHA. Ręczna weryfikacja i późniejsze działanie bota zależą od dostępu przyznanego przez G4Skins.
+G4Skins może ponownie wymagać weryfikacji również wtedy, gdy zapisane cookie nadal ma przyszłą datę ważności. Bot używa lokalnego, zmodyfikowanego sterownika Puppeteera i przed zgłoszeniem błędu podejmuje ograniczoną próbę odnowienia weryfikacji w tej samej przeglądarce. Obsługuje zarówno oczekiwanie na kontrolę JavaScript, jak i widoczne pole potwierdzenia w ramce `challenges.cloudflare.com`, także wewnątrz zamkniętego Shadow DOM.
+
+Odnowienie wykonuje najwyżej jedno przeładowanie i trzy kliknięcia pola weryfikacji w ciągu domyślnie 90 sekund. Nie używa płatnych usług, zewnętrznych solverów ani proxy. Sukces jest potwierdzany dopiero po pojawieniu się oczekiwanego elementu G4Skins. Rozwiązanie nie gwarantuje obsługi każdego rodzaju challenge ani stałego dostępu, jeśli serwis zmieni zabezpieczenia. Gdy próba się nie powiedzie, można wykonać weryfikację ręczną:
 
 1. Z własnego komputera uruchom tunel SSH, podstawiając ścieżkę do swojego klucza i adres serwera:
 
@@ -42,10 +44,18 @@ Bot czeka do 30 sekund na widoczny przycisk Daily Case. Nagrody EXP i skrzynki o
 
 AutoOpen podaje godzinę następnego otwarcia w strefie `Europe/Warsaw`. Po otwarciu wysyła jedną wiadomość z nagrodą i kolejnym terminem. Jeśli otwarcie nie zostało potwierdzone, nie zgłasza sukcesu. Przy weryfikacji dostępu zachowuje okno i planuje kolejne sprawdzenie za 30 minut.
 
+### Konfiguracja odnowienia weryfikacji
+
+`CF_AUTO_RECOVERY=true` włącza lokalną próbę automatycznego odnowienia. Ustaw `false`, aby korzystać wyłącznie z ręcznej weryfikacji. `CF_RECOVERY_TIMEOUT_MS=90000` określa limit czasu w milisekundach; dopuszczalny zakres to 1000–180000. Zmienne są przekazywane przez `docker-compose.override.yml`. Po zmianie `.env` odtwórz usługę `bot` poleceniem `docker compose up -d --no-deps bot`.
+
+Zależność `puppeteer-core` jest przypięta aliasem npm do `rebrowser-puppeteer-core@24.8.1`, zgodnego z używanym Node.js 18. Nie wymaga to pobierania innej przeglądarki — nadal używany jest systemowy Chromium ARM64. Kod wykorzystuje klienta CDP ramki z tej przypiętej wersji wyłącznie do znalezienia pola weryfikacji Cloudflare. Przy aktualizacji sterownika uruchom test zamkniętego Shadow DOM.
+
+Po restarcie zadania AutoOpen i watchdog są przywracane w callbacku gotowości Telegrama. Nie czekają na zakończenie `bot.launch()`, ponieważ przy long pollingu następuje ono dopiero po zatrzymaniu bota.
+
 ## Testy
 
 Testy korzystają z Node.js, Chromium i ekranu wirtualnego dostępnych w kontenerze. Wykorzystują syntetyczny HTML; nie otwierają prawdziwej skrzynki ani nie wysyłają wiadomości Telegram.
 
 ```bash
-docker compose exec bot node --test tests/daily-case.test.cjs tests/browser-session.test.cjs
+docker compose exec bot node --test tests/daily-case.test.cjs tests/browser-session.test.cjs tests/access-recovery.test.cjs tests/startup.test.cjs
 ```

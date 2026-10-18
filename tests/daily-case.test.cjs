@@ -25,7 +25,9 @@ test('Daily Case DOM, history, timing and message regression',async()=>{
     await daily.clickDailyButton(page);
     assert.equal(await page.evaluate(()=>window.clicks),1);
     await page.setContent('<title>Just a moment...</title>');
-    await assert.rejects(()=>daily.waitForDailyButton(page,100),{code:'SITE_VERIFICATION'});
+    process.env.CF_AUTO_RECOVERY='false';
+    try { await assert.rejects(()=>daily.waitForDailyButton(page,100),{code:'SITE_VERIFICATION'}); }
+    finally { delete process.env.CF_AUTO_RECOVERY; }
     assert.equal(daily.parseCooldown('18 : 37 : 15'),67035000);
     assert.equal(daily.parseCooldown('20h'),72000000);
     assert.equal(daily.parseCooldown('Wymagany wyższy poziom'),null);

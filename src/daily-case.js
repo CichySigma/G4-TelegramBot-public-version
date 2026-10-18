@@ -1,5 +1,6 @@
 const DAILY_URL = 'https://g4skins.com/daily-case';
 const OPEN_URL = `${DAILY_URL}/open`;
+const {waitForPageAccess} = require('./access-recovery');
 
 // This function runs in Chromium and is also exercised against HTML fixtures.
 function dailyButtonState() {
@@ -34,9 +35,7 @@ function latestHistoryRow() {
 
 async function waitForDailyButton(page, timeout = 30000) {
   try {
-    const handle = await page.waitForFunction(dailyButtonState,{timeout,polling:250});
-    await handle.dispose();
-    return await page.evaluate(dailyButtonState);
+    return await waitForPageAccess(page,dailyButtonState,{timeout});
   } catch (error) {
     if (error.name !== 'TimeoutError') throw error;
     const title = await page.title();
@@ -76,9 +75,9 @@ async function clickDailyButton(page) {
 async function readLatestReward(page) {
   await page.goto(DAILY_URL,{waitUntil:'domcontentloaded',timeout:30000});
   try {
-    await page.waitForFunction(() => {
+    await waitForPageAccess(page,() => {
       const button = document.querySelectorAll('.G_Button.blue')[0];
-      return button && button.getClientRects().length && !button.disabled;
+      return !!(button && button.getClientRects().length && !button.disabled);
     },{timeout:30000});
   } catch (error) {
     if (/just a moment|attention required|access denied/i.test(await page.title())) {

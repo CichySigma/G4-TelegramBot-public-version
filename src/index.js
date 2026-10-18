@@ -442,9 +442,12 @@ async function loginToSteam(ctx, loginMethod = 'password') {
         await page.goto(CONFIG.URLS.G4SKINS_DAILY, { waitUntil: 'networkidle2' }).catch(() => {});
 
         if (/just a moment|attention required|access denied/i.test(await page.title())) {
-          await holdBrowserForVerification(userId,browser,page);
-          await ctx.reply('G4Skins wymaga weryfikacji dostępu. Użyj /verify i otwórz przeglądarkę serwera przez tunel SSH.');
-          return false;
+          try { await daily.waitForDailyButton(page); }
+          catch (error) {
+            await holdBrowserForVerification(userId,browser,page);
+            await ctx.reply(error.message);
+            return false;
+          }
         }
         const stillLoggedIn = await page.evaluate(() => {
           return !document.querySelector('.login-form-content');
@@ -1884,13 +1887,15 @@ async function startBot() {
   logger.info('🤖 MongoDB połączony - uruchamiam bota Telegram...');
 
   try {
-    await bot.launch();
+    // Long polling resolves launch() only after the bot stops. Restore scheduled
+    // work in its readiness callback so restarts do not leave AutoOpen dormant.
+    await bot.launch({}, () => {
     logger.info('✅ Bot uruchomiony pomyślnie!');
     logger.info('🎯 Bot gotowy do pracy - wyślij /start w Telegramie');
 
     // Uruchom Watchdog i przywróć zadania AutoOpen z MongoDB
     startAutoOpenWatchdog();
-    await restoreAutoOpenTasks();
+    restoreAutoOpenTasks().catch(error => logger.error('Błąd przywracania AutoOpen:', error.message));
 
     if (!isProduction) {
       const ConsoleCommands = require('./console-commands');
@@ -1907,6 +1912,7 @@ async function startBot() {
         consoleCmd.start();
       }, 500);
     }
+    });
   } catch (err) {
     logger.error('❌ Błąd uruchamiania bota:', err);
     process.exit(1);

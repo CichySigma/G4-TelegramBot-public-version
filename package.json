@@ -12,7 +12,7 @@
     "express": "^4.22.1",
     "mongoose": "^8.0.0",
     "puppeteer": "^21.11.0",
-    "puppeteer-core": "^23.0.0",
+    "puppeteer-core": "npm:rebrowser-puppeteer-core@24.8.1",
     "puppeteer-extra": "^3.x.x",
     "puppeteer-extra-plugin-stealth": "^2.x.x",
     "telegraf": "^4.x.x"
