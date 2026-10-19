@@ -20,7 +20,9 @@ Compose automatycznie dołącza `docker-compose.override.yml`. Uruchamia on prze
 
 ## Ręczna weryfikacja strony
 
-G4Skins może zwrócić ekran weryfikacji i HTTP 403. Bot rozpoznaje ten stan i nie zgłasza go jako brak przycisku ani udane logowanie. Automatyzacja nie rozwiązuje CAPTCHA. Ręczna weryfikacja i późniejsze działanie bota zależą od dostępu przyznanego przez G4Skins.
+G4Skins może ponownie wymagać weryfikacji również wtedy, gdy zapisane cookie nadal ma przyszłą datę ważności. Bot używa lokalnego, zmodyfikowanego sterownika Puppeteera i przed zgłoszeniem błędu podejmuje ograniczoną próbę odnowienia weryfikacji w tej samej przeglądarce. Obsługuje zarówno oczekiwanie na kontrolę JavaScript, jak i widoczne pole potwierdzenia w ramce `challenges.cloudflare.com`, także wewnątrz zamkniętego Shadow DOM.
+
+Odnowienie wykonuje najwyżej jedno przeładowanie i trzy kliknięcia pola weryfikacji w ciągu domyślnie 90 sekund. Nie używa płatnych usług, zewnętrznych solverów ani proxy. Sukces jest potwierdzany dopiero po pojawieniu się oczekiwanego elementu G4Skins. Rozwiązanie nie gwarantuje obsługi każdego rodzaju challenge ani stałego dostępu, jeśli serwis zmieni zabezpieczenia. Gdy próba się nie powiedzie, można wykonać weryfikację ręczną:
 
 1. Z własnego komputera uruchom tunel SSH, podstawiając ścieżkę do swojego klucza i adres serwera:
 
@@ -38,14 +40,43 @@ Jeśli ręczna weryfikacja również kończy się HTTP 403, skontaktuj się z G4
 
 ## Nagrody i harmonogram
 
-Bot czeka do 30 sekund na widoczny przycisk Daily Case. Nagrody EXP i skrzynki odczytuje z pierwszego wiersza historii po kliknięciu pierwszego przycisku `.G_Button.blue`. Porównuje wpis przed otwarciem i po nim, aby nie przypisać starej nagrody do nowej próby. Skiny nadal wykrywa przez różnicę ekwipunku.
+Bot czeka na zakończenie hydratacji Nuxt/Vue i podłączenie obsługi kliknięcia do widocznego przycisku. Odróżnia otwieranie od przycisku logowania, linku do wymagań oraz trwającej animacji. Przed kliknięciem sprawdza, czy przycisku nie zasłania popup. Nie klika elementu przez zasłaniające okno.
+
+Otwarcie Daily Case na aktualnej stronie używa Socket.IO (`@User/WheelBonus->Claim`). Bot podłącza pasywny obserwator CDP **przed jednym zwykłym kliknięciem** i czeka do 25 sekund na odpowiedź o zgodnym identyfikatorze żądania i połączenia. Nie wysyła własnych żądań otwarcia. Następnie czeka do 30 sekund na zakończenie animacji i odczyt licznika; nie opuszcza strony po arbitralnych 5 sekundach. Nagrody EXP i skrzynki dodatkowo odczytuje z pierwszego wiersza historii w osobnej karcie, porównując wpis sprzed próby. Skiny mogą być potwierdzane także przez różnicę ekwipunku. Stan MongoDB zapisywany przed kliknięciem chroni przed ponawianiem niepotwierdzonego otwarcia również po restarcie.
+
+Karta historii otrzymuje ten sam rozmiar widoku co karta otwierania. Po zakończeniu hydratacji bot sprawdza, czy pierwszy `.G_Button.blue` ma tekst historii, uruchamia jego `click()` w DOM i czeka na tabelę. Jest to akcja wyłącznie odczytu: na aktualnej stronie dekoracyjny film `video.box-anim` może przykrywać punkt zwykłego kliknięcia tego przycisku. Otwarcie skrzynki nie korzysta z tego obejścia.
 
 AutoOpen podaje godzinę następnego otwarcia w strefie `Europe/Warsaw`. Po otwarciu wysyła jedną wiadomość z nagrodą i kolejnym terminem. Jeśli otwarcie nie zostało potwierdzone, nie zgłasza sukcesu. Przy weryfikacji dostępu zachowuje okno i planuje kolejne sprawdzenie za 30 minut.
+
+Komendy zmieniające kartę, logowanie, wylogowanie i harmonogram korzystają ze wspólnej blokady dla użytkownika. `/stop` pozostaje dostępne podczas operacji: unieważnia trwający cykl, zapobiega kolejnemu kliknięciu, jeśli jeszcze nie nastąpiło, i blokuje ponowne uruchomienie harmonogramu przez kończące się zadanie. Już wysłanego kliknięcia nie można cofnąć. `/checkstatus` odróżnia termin otwarcia od terminu ponownego sprawdzenia błędu.
+
+## Diagnostyka i zarządzanie
+
+| Komenda | Działanie |
+| --- | --- |
+| `/diagnose` | Stan połączenia, aktywna operacja, ścieżka strony, gotowość przycisku i kod ostatniej próby. Nie przeładowuje strony. |
+| `/lastopen` | Zapisany etap, czas, wynik i kod ostatniej próby. Kody `DAILY_NO_REQUEST_OBSERVED`, `DAILY_ACK_TIMEOUT` i `DAILY_CLAIM_REJECTED` odróżniają brak zaobserwowanego żądania, brak odpowiedzi i odmowę serwera. |
+| `/reconcile` | Sprawdza historię oraz licznik poprzedniej niepotwierdzonej próby; nie klika otwarcia. |
+| `/retryopen potwierdzam` | Po ręcznym sprawdzeniu historii zwalnia blokadę niepotwierdzonej próby. Samo polecenie nie otwiera skrzynki; następnie użyj `/open` lub `/autoopen`. |
+| `/preview` | Pozostawia okno otwarte przez 30 minut również po AutoOpen. Panel noVNC wymaga istniejącego tunelu SSH. |
+| `/preview off` | Przywraca usypianie okna po zadaniu. |
+
+`/resetall` wymaga identyfikatora administratora w `BOT_ADMIN_IDS` (lista rozdzielona przecinkami), a przy jego braku korzysta z `TELEGRAM_CHAT_ID`. Bez skonfigurowanego administratora polecenie jest niedostępne. Reset jest odrzucany, gdy trwa operacja przeglądarki. Nowe komendy nie publikują cookies, haseł ani PIN-u. PIN jest również maskowany w `/dbtest` i konsoli. Menu Telegram otrzymuje nazwy bez prefiksu `/`, zgodnie z wymaganiami API.
+
+### Konfiguracja odnowienia weryfikacji
+
+`CF_AUTO_RECOVERY=true` włącza lokalną próbę automatycznego odnowienia. Ustaw `false`, aby korzystać wyłącznie z ręcznej weryfikacji. `CF_RECOVERY_TIMEOUT_MS=90000` określa limit czasu w milisekundach; dopuszczalny zakres to 1000–180000. Zmienne są przekazywane przez `docker-compose.override.yml`. Po zmianie `.env` odtwórz usługę `bot` poleceniem `docker compose up -d --no-deps bot`.
+
+Zależność `puppeteer-core` jest przypięta aliasem npm do `rebrowser-puppeteer-core@24.8.1`, zgodnego z używanym Node.js 18. Nie wymaga to pobierania innej przeglądarki — nadal używany jest systemowy Chromium ARM64. Kod wykorzystuje klienta CDP ramki z tej przypiętej wersji wyłącznie do znalezienia pola weryfikacji Cloudflare. Przy aktualizacji sterownika uruchom test zamkniętego Shadow DOM.
+
+Po restarcie zadania AutoOpen i watchdog są przywracane w callbacku gotowości Telegrama. Nie czekają na zakończenie `bot.launch()`, ponieważ przy long pollingu następuje ono dopiero po zatrzymaniu bota.
 
 ## Testy
 
 Testy korzystają z Node.js, Chromium i ekranu wirtualnego dostępnych w kontenerze. Wykorzystują syntetyczny HTML; nie otwierają prawdziwej skrzynki ani nie wysyłają wiadomości Telegram.
 
 ```bash
-docker compose exec bot node --test tests/daily-case.test.cjs tests/browser-session.test.cjs
+docker compose exec bot node --test tests/*.test.cjs
 ```
+
+Testy obejmują także rzeczywisty Chromium z lokalnym serwerem WebSocket i odpowiedzią opóźnioną o ponad 6 sekund, niedokończoną hydratację, zasłonięty przycisk, korelację odpowiedzi, trwałą blokadę niepewnej próby, izolację operacji użytkowników, zatrzymanie harmonogramu oraz unikalność komend. Testy nie zastępują potwierdzenia najbliższego prawdziwego otwarcia na koncie.

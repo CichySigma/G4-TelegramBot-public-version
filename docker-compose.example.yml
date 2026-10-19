@@ -7,4 +7,5 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}
       MONGODB_URI: ${MONGODB_URI:?Set MONGODB_URI in .env}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      BOT_ADMIN_IDS: ${BOT_ADMIN_IDS:-}
     shm_size: "1gb"

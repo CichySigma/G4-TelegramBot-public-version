@@ -5,6 +5,8 @@ services:
       BROWSER_NATIVE: "true"
       BROWSER_PROFILE_ROOT: /app/browser-profiles
       DISPLAY: ":99"
+      CF_AUTO_RECOVERY: "${CF_AUTO_RECOVERY:-true}"
+      CF_RECOVERY_TIMEOUT_MS: "${CF_RECOVERY_TIMEOUT_MS:-90000}"
     ports:
       - "127.0.0.1:6080:6080"
     volumes:
