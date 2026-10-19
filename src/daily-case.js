@@ -63,6 +63,21 @@ async function goToDaily(page, {refresh = false} = {}) {
   return waitForDailyButton(page);
 }
 
+async function prepareClick(page, button, label) {
+  await button.evaluate(el=>el.scrollIntoView({block:'center',inline:'center',behavior:'instant'}));
+  try {
+    const ready=await page.waitForFunction(el=>{
+      if(!el.isConnected || el.disabled)return false;
+      const r=el.getBoundingClientRect(),target=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);
+      return !!target && (target===el || el.contains(target));
+    },{timeout:5000,polling:'raf'},button);
+    await ready.dispose();
+  }catch(error){
+    if(error.name!=='TimeoutError')throw error;
+    throw new Error(`Przycisk ${label} zasłania inne okno lub element strony. Sprawdź /preview.`);
+  }
+}
+
 async function clickDailyButton(page, beforeClick = async()=>{}) {
   const state = await waitForDailyButton(page);
   if (state.blocked) return state;
@@ -75,13 +90,7 @@ async function clickDailyButton(page, beforeClick = async()=>{}) {
       if (!usable) continue;
       const blocked = await button.evaluate(el => el.classList.contains('block') || el.disabled || el.getAttribute('aria-disabled') === 'true');
       if (blocked) return {...state,blocked:true};
-      await button.scrollIntoView();
-      const hit = await button.evaluate(el => {
-        const r=el.getBoundingClientRect();
-        const target=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);
-        return !!target && (target===el || el.contains(target));
-      });
-      if (!hit) throw new Error('Przycisk otwarcia zasłania inne okno strony. Otwórz /preview i zamknij to okno.');
+      await prepareClick(page,button,'otwarcia');
       await beforeClick();
       await button.click();
       return {...state,clicked:true};
@@ -94,8 +103,12 @@ async function readLatestReward(page) {
   await page.goto(DAILY_URL,{waitUntil:'domcontentloaded',timeout:30000});
   try {
     await waitForPageAccess(page,() => {
+      const root=document.querySelector('#__nuxt');
+      if(root && root.__vue_app__?.$nuxt?.isHydrating!==false)return false;
       const button = document.querySelectorAll('.G_Button.blue')[0];
-      return !!(button && button.getClientRects().length && !button.disabled);
+      if(!button || !button.getClientRects().length || button.disabled || button.querySelector('.button_load'))return false;
+      return !root || Reflect.ownKeys(button).some(key=>String(key)==='Symbol(_vei)' &&
+        Object.keys(button[key]||{}).some(event=>/^onClick/.test(event)));
     },{timeout:30000});
   } catch (error) {
     if (/just a moment|attention required|access denied/i.test(await page.title())) {
@@ -104,7 +117,13 @@ async function readLatestReward(page) {
     throw error;
   }
   const button = await page.$('.G_Button.blue');
-  try { await button.click(); } finally { await button.dispose(); }
+  try {
+    if(!await button.evaluate(el=>/history|histori/i.test(el.textContent)))throw new Error('Pierwszy niebieski przycisk nie jest historią nagród. Sprawdź układ strony.');
+    // The landing page's decorative video.box-anim overlaps this control.
+    // Invoke the user's requested read-only history button, then await its table.
+    // Opening the case still requires an unobstructed real pointer click.
+    await button.evaluate(el=>el.click());
+  } finally { await button.dispose(); }
   await page.waitForFunction(() => {
     const table = [...document.querySelectorAll('.daily-reward-history-table')].find(el => el.getClientRects().length);
     return !!table && (!!table.querySelector('tbody tr') || /no data|brak|empty/i.test(table.textContent));
@@ -114,7 +133,10 @@ async function readLatestReward(page) {
 
 async function readHistoryInTab(page) {
   const tab=await page.browser().newPage();
-  try { return await readLatestReward(tab); }
+  try {
+    await tab.setViewport(page.viewport() || {width:1366,height:768});
+    return await readLatestReward(tab);
+  }
   finally { await tab.close().catch(()=>{}); await page.bringToFront().catch(()=>{}); }
 }
 

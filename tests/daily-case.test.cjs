@@ -36,6 +36,14 @@ test('Daily Case DOM, history, timing and message regression',async()=>{
     await assert.rejects(()=>daily.clickDailyButton(page),/warunków/);
     await page.setContent('<div class="top-options"><button class="G_Button big max"><div class="button_load"></div>Open</button></div>');
     await assert.rejects(()=>daily.clickDailyButton(page),/przetwarza/);
+    const openingUrl=page.url();let historyViewport;
+    const parent={viewport:()=>({width:1366,height:768}),bringToFront:()=>page.bringToFront(),browser:()=>({newPage:async()=>{
+      const tab=await browser.newPage();await tab.setRequestInterception(true);
+      tab.on('request',request=>request.respond({status:200,contentType:'text/html',body:`<div id="__nuxt"><button class="G_Button blue">History</button><div id="result"></div></div><video class="box-anim" style="position:fixed;inset:0;width:100vw;height:100vh;z-index:999;background:#fff"></video><script>document.querySelector('#__nuxt').__vue_app__={$nuxt:{isHydrating:false}};setTimeout(()=>{const button=document.querySelector('button');button[Symbol('_vei')]={onClick:()=>{}};button.onclick=()=>{document.querySelector('#result').innerHTML=${JSON.stringify(row('Experience points','','700 EXP','/exp.svg'))};};},900)</script>`}));
+      const close=tab.close.bind(tab);tab.close=async()=>{historyViewport=tab.viewport();await close();};return tab;
+    }})};
+    const historical=await daily.readHistoryInTab(parent);
+    assert.equal(historical.amount,'700');assert.equal(page.url(),openingUrl);assert.equal(historyViewport.width,1366);
     await page.setContent('<title>Just a moment...</title>');
     process.env.CF_AUTO_RECOVERY='false';
     try { await assert.rejects(()=>daily.waitForDailyButton(page,100),{code:'SITE_VERIFICATION'}); }
