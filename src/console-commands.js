@@ -285,7 +285,7 @@ class ConsoleCommands {
       console.log('\n\x1b[36m%s\x1b[0m', `Dane użytkownika ${this.defaultUserId}:`);
       console.log(`  Username: ${user.steamUsername || 'BRAK'}`);
       console.log(`  Password: ${user.steamPassword ? '*** (zapisane)' : 'BRAK'}`);
-      console.log(`  PIN:      ${user.familyViewPin || 'BRAK'}`);
+      console.log(`  PIN:      ${user.familyViewPin ? 'ZAPISANY' : 'BRAK'}`);
       console.log(`  AutoOpen: ${user.autoOpenEnabled ? 'TAK' : 'NIE'}`);
       console.log(`  NextCase: ${user.nextCaseTime ? new Date(user.nextCaseTime).toLocaleString('pl-PL') : 'Brak'}\n`);
     } else {

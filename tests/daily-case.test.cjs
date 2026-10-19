@@ -24,6 +24,18 @@ test('Daily Case DOM, history, timing and message regression',async()=>{
     await daily.waitForDailyButton(page,6000);
     await daily.clickDailyButton(page);
     assert.equal(await page.evaluate(()=>window.clicks),1);
+    await page.setContent('<div id="__nuxt"><div class="top-options"><button class="G_Button big max">Open</button></div></div><script>window.readyAt=Date.now()+900;document.querySelector("#__nuxt").__vue_app__={$nuxt:{isHydrating:false}};setTimeout(()=>{const b=document.querySelector("button");b[Symbol("_vei")]={onClick:()=>{}};b.onclick=()=>window.clicks=1;},900)</script>');
+    assert.equal(await page.evaluate(daily.dailyButtonState),null);
+    await daily.clickDailyButton(page);
+    assert.equal(await page.evaluate(()=>window.clicks),1);
+    assert.ok(await page.evaluate(()=>Date.now()>=window.readyAt));
+    await page.setContent('<div class="top-options"><button class="G_Button big max" onclick="window.unexpected=true">Open</button></div><div style="position:fixed;inset:0;z-index:999;background:#fff">An unrelated popup</div>');
+    await assert.rejects(()=>daily.clickDailyButton(page),/zasłania/);
+    assert.equal(await page.evaluate(()=>window.unexpected),undefined);
+    await page.setContent('<div class="top-options"><a class="G_Button big max" href="/daily-case">Requirements</a></div>');
+    await assert.rejects(()=>daily.clickDailyButton(page),/warunków/);
+    await page.setContent('<div class="top-options"><button class="G_Button big max"><div class="button_load"></div>Open</button></div>');
+    await assert.rejects(()=>daily.clickDailyButton(page),/przetwarza/);
     await page.setContent('<title>Just a moment...</title>');
     process.env.CF_AUTO_RECOVERY='false';
     try { await assert.rejects(()=>daily.waitForDailyButton(page,100),{code:'SITE_VERIFICATION'}); }

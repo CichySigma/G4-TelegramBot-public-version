@@ -7,7 +7,7 @@ const vm=require('node:vm');
 test('AutoOpen is restored while Telegram long polling is still running',async()=>{
   const source=fs.readFileSync(path.join(__dirname,'../src/index.js'),'utf8');
   const start=source.indexOf('async function startBot() {');
-  const end=source.indexOf('\nstartBot();',start);
+  const end=source.indexOf('\nbot.catch(',start);
   let watchdog=0,restored=0;
   const scope={logger:{info(){},error(){}},commands:[],isProduction:true,
     connectDB:async()=>true,

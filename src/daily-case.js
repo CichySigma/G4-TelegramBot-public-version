@@ -4,13 +4,21 @@ const {waitForPageAccess} = require('./access-recovery');
 
 // This function runs in Chromium and is also exercised against HTML fixtures.
 function dailyButtonState() {
+  // SSR markup can be visible before Vue attaches its click handler. Hydration
+  // also replaces these nodes; visibility alone is not application readiness.
+  const root = document.querySelector('#__nuxt');
+  if (root && root.__vue_app__?.$nuxt?.isHydrating !== false) return null;
   const visible = el => !!el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
   const candidates = [...document.querySelectorAll('.top-options .G_Button.big.max, .top-options .G_Button.big')];
   const button = candidates.find(visible);
   if (!button) return null;
+  if (root && !Reflect.ownKeys(button).some(key =>
+    String(key)==='Symbol(_vei)' && Object.keys(button[key] || {}).some(event=>/^onClick/.test(event)))) return null;
   const time = (button.querySelector('.button_text') || button).textContent.trim();
   const blocked = button.classList.contains('block') || button.disabled || button.getAttribute('aria-disabled') === 'true';
-  return {found:true, blocked:!!blocked, time:blocked ? time : null};
+  const loading = !!button.querySelector('.button_load');
+  const actionable = button.tagName === 'BUTTON' && !button.classList.contains('green');
+  return {found:true, blocked:!!blocked, loading, actionable, time:blocked ? time : null};
 }
 
 function latestHistoryRow() {
@@ -48,16 +56,18 @@ async function waitForDailyButton(page, timeout = 30000) {
   }
 }
 
-async function goToDaily(page) {
-  if (page.url().split('?')[0] !== OPEN_URL) {
+async function goToDaily(page, {refresh = false} = {}) {
+  if (refresh || page.url().split('?')[0] !== OPEN_URL) {
     await page.goto(OPEN_URL,{waitUntil:'domcontentloaded',timeout:30000});
   }
   return waitForDailyButton(page);
 }
 
-async function clickDailyButton(page) {
+async function clickDailyButton(page, beforeClick = async()=>{}) {
   const state = await waitForDailyButton(page);
   if (state.blocked) return state;
+  if (!state.actionable) throw new Error('Strona wymaga logowania lub spełnienia warunków Daily Case. Użyj /verify.');
+  if (state.loading) throw new Error('Strona nadal przetwarza poprzednie otwarcie. Użyj /reconcile.');
   const buttons = await page.$$('.top-options .G_Button.big.max, .top-options .G_Button.big');
   try {
     for (const button of buttons) {
@@ -65,6 +75,14 @@ async function clickDailyButton(page) {
       if (!usable) continue;
       const blocked = await button.evaluate(el => el.classList.contains('block') || el.disabled || el.getAttribute('aria-disabled') === 'true');
       if (blocked) return {...state,blocked:true};
+      await button.scrollIntoView();
+      const hit = await button.evaluate(el => {
+        const r=el.getBoundingClientRect();
+        const target=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);
+        return !!target && (target===el || el.contains(target));
+      });
+      if (!hit) throw new Error('Przycisk otwarcia zasłania inne okno strony. Otwórz /preview i zamknij to okno.');
+      await beforeClick();
       await button.click();
       return {...state,clicked:true};
     }
@@ -89,9 +107,15 @@ async function readLatestReward(page) {
   try { await button.click(); } finally { await button.dispose(); }
   await page.waitForFunction(() => {
     const table = [...document.querySelectorAll('.daily-reward-history-table')].find(el => el.getClientRects().length);
-    return !!table?.querySelector('tbody tr');
+    return !!table && (!!table.querySelector('tbody tr') || /no data|brak|empty/i.test(table.textContent));
   },{timeout:15000});
   return page.evaluate(latestHistoryRow);
+}
+
+async function readHistoryInTab(page) {
+  const tab=await page.browser().newPage();
+  try { return await readLatestReward(tab); }
+  finally { await tab.close().catch(()=>{}); await page.bringToFront().catch(()=>{}); }
 }
 
 function formatNext(nextTime) {
@@ -114,4 +138,4 @@ function formatOpened(reward, nextTime, cooldownKnown = true) {
       `Nie udało się odczytać czasu następnego otwarcia. Ponowne sprawdzenie o godz. ${formatNext(nextTime)}.`);
 }
 
-module.exports = {dailyButtonState,latestHistoryRow,waitForDailyButton,goToDaily,clickDailyButton,readLatestReward,formatNext,formatOpened,parseCooldown};
+module.exports = {dailyButtonState,latestHistoryRow,waitForDailyButton,goToDaily,clickDailyButton,readLatestReward,readHistoryInTab,formatNext,formatOpened,parseCooldown};

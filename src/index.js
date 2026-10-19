@@ -25,6 +25,11 @@ const path = require('path');
 const fs = require('fs');
 const puppeteerCore = require('puppeteer-core');
 const browserSession = require('./browser-session');
+const {OperationGate} = require('./operation-gate');
+const claim = require('./daily-claim');
+const operations = new OperationGate();
+const scheduleWrites = new Map();
+let maintenance = false;
 const chromium = require('@sparticuz/chromium');
 const logger = require('./logger');
 
@@ -95,7 +100,9 @@ const userSchema = new mongoose.Schema({
   steamPassword: String,
   familyViewPin: String,
   autoOpenEnabled: { type: Boolean, default: false },
-  nextCaseTime: { type: Number, default: null }
+  nextCaseTime: { type: Number, default: null },
+  scheduleReason: String,
+  lastDailyAttempt: mongoose.Schema.Types.Mixed
 });
 
 const sessionSchema = new mongoose.Schema({
@@ -135,54 +142,21 @@ const lastWatchdogLogTime = new Map();
 
 // ====== AUTO-CLEANUP STARYCH SESJI (oszczędzanie RAM) ======
 async function cleanupIdleSessions() {
-  const now = Date.now();
-  const sessionsToDelete = [];
-
-  for (const [userId, session] of activeSessions.entries()) {
-    const createdTime = sessionCreationTime.get(userId) || 0;
-    const idleTime = now - createdTime;
-
-    // Sprawdź czy użytkownik ma włączony AutoOpen
-    const isAutoOpen = session?.autoOpenEnabled || session?.autoOpenTimeout;
-
-    if (isAutoOpen) {
-      // Jeśli sesja ma aktywny AutoOpen, ale przeglądarka 'wisi' bezczynna – zamknij ją dla RAM
-      if (session.browser && idleTime > CONFIG.SESSION_IDLE_TIMEOUT) {
-        logger.info(`🧹 [${userId}] Zamykam bezczynną przeglądarkę oczekującą na AutoOpen (oszczędzanie RAM)`);
-        try {
-          await session.browser.close();
-        } catch (e) {}
-        session.browser = null;
-        session.page = null;
+  if(maintenance)return;
+  for(const [userId,session] of activeSessions) {
+    await operations.run(userId,'cleanup',async()=>{
+      if(maintenance || session.previewUntil>Date.now() || session.verificationRequired)return;
+      const idleTime=Date.now()-(sessionCreationTime.get(userId)||0);
+      if(idleTime<=CONFIG.SESSION_IDLE_TIMEOUT)return;
+      if(session.browser) {
+        try {await session.browser.close();}
+        catch(error){logger.warn('['+userId+'] Cleanup: '+error.message);}
+        session.browser=null;session.page=null;
       }
-      continue; // Nie usuwaj wpisu sesji dla AutoOpen!
-    }
-
-    if (idleTime > CONFIG.SESSION_IDLE_TIMEOUT) {
-      logger.info(`🧹 [${userId}] Czyszczę idle session (${Math.round(idleTime / 60000)} min nieaktywna)`);
-      sessionsToDelete.push(userId);
-    }
-  }
-
-  // Zamknij i usuń nieużywane sesje
-  for (const userId of sessionsToDelete) {
-    const session = activeSessions.get(userId);
-    if (session?.browser) {
-      try {
-        await session.browser.close();
-        logger.info(`🧹 [${userId}] Przeglądarka zamknięta przez auto-cleanup`);
-      } catch (e) {
-        logger.warn(`⚠️ [${userId}] Błąd w auto-cleanup:`, e.message);
-      }
-    }
-    activeSessions.delete(userId);
-    sessionCreationTime.delete(userId);
-    autoOpenLocks.delete(userId);
-    lastWatchdogLogTime.delete(userId);
-  }
-
-  if (activeSessions.size > 0) {
-    logger.info(`💾 RAM: ${activeSessions.size} zarejestrowanych sesji w pamięci`);
+      if(session.autoOpenEnabled || session.autoOpenTimeout)return;
+      activeSessions.delete(userId);sessionCreationTime.delete(userId);
+      autoOpenLocks.delete(userId);lastWatchdogLogTime.delete(userId);
+    });
   }
 }
 
@@ -277,7 +251,7 @@ async function saveUser(user) {
 
     const result = await User.findOneAndUpdate(
       { telegramId: user.telegramId },
-      user,
+      {$set:Object.fromEntries(['steamUsername','steamPassword','familyViewPin'].filter(key=>user[key]!==undefined).map(key=>[key,user[key]]))},
       { upsert: true, new: true }
     );
 
@@ -1136,7 +1110,7 @@ async function ensureBrowserOpen(userId, ctx = null) {
  * zachowując dane harmonogramu AutoOpen.
  */
 async function closeBrowserSilently(userId) {
-  if (activeSessions.get(userId)?.verificationRequired) return;
+  if (activeSessions.get(userId)?.verificationRequired || activeSessions.get(userId)?.previewUntil>Date.now()) return;
   const session = activeSessions.get(userId);
   if (session?.browser) {
     try {
@@ -1155,7 +1129,36 @@ async function closeBrowserSilently(userId) {
 // ====== G4SKINS API & OPERATIONS ======
 
 const daily = require('./daily-case');
-const dailyOperationLocks = new Set();
+
+async function saveAttempt(userId, attempt) {
+  await User.findOneAndUpdate({telegramId:userId}, {$set:{lastDailyAttempt:attempt}}, {upsert:true});
+  const session=activeSessions.get(userId);
+  if(session) session.lastDailyAttempt=attempt;
+  logger.info(`[${userId}] Daily attempt: ${attempt.status}; phase=${attempt.phase}; code=${attempt.code||'-'}`);
+}
+
+function historyReward(row) {
+  if(row?.type==='exp' && row.amount) return `${row.amount} EXP`;
+  if(row?.name) return `${row.type==='case'?'skrzynka ':''}${row.name} (${row.value})`;
+  return null;
+}
+
+async function reconcileAttempt(userId, page, attempt, info) {
+  let row=null;
+  try { row=await daily.readHistoryInTab(page); }
+  catch(error){logger.warn(`[${userId}] Uzgadnianie historii: ${error.message}`);}
+  const changed=attempt.previousSignature && row?.signature!==attempt.previousSignature && row?.type!=='empty';
+  const cooldown=info.blocked?daily.parseCooldown(info.time):null;
+  if(changed || cooldown>0) {
+    const confirmed={...attempt,status:'confirmed',phase:'reconciled',finishedAt:Date.now(),
+      reward:changed?historyReward(row):attempt.reward||null,cooldownMs:cooldown,
+      code:changed?'HISTORY_CHANGED':'COOLDOWN_CONFIRMED'};
+    await saveAttempt(userId,confirmed);
+    return {success:true,reward:confirmed.reward,newCooldownMs:cooldown,cooldownKnown:cooldown>0,reconciled:true};
+  }
+  // No repeat click until the user has checked history and explicitly released it.
+  return {success:false,pending:true,error:'Poprzednie kliknięcie pozostaje niepotwierdzone. Bot sprawdza wynik bez ponownego otwierania. Szczegóły: /lastopen. Po sprawdzeniu historii: /retryopen.'};
+}
 
 async function checkDailyCase(ctx) {
   const userId = ctx.from.id.toString();
@@ -1165,9 +1168,11 @@ async function checkDailyCase(ctx) {
     return {found:false,error:'Brak aktywnej sesji. Użyj /login.'};
   }
   try {
-    const info = await daily.goToDaily(session.page);
+    const info = await daily.goToDaily(session.page,{refresh:true});
     session.verificationRequired = false;
     await saveSessionCookies(userId, await session.page.cookies());
+    if(!info.actionable)throw new Error('Strona wymaga logowania lub spełnienia warunków Daily Case. Użyj /verify.');
+    if(info.loading)throw new Error('Strona nadal przetwarza otwarcie. Sprawdź /lastopen lub /reconcile.');
     if (info.blocked) {
       const timeMs = daily.parseCooldown(info.time);
       if (timeMs===null) throw new Error('Daily Case jest zablokowany, ale strona nie podała czasu odblokowania.');
@@ -1196,99 +1201,108 @@ async function readInventory(page) {
 }
 
 async function openDailyCase(ctx) {
-  const userId = ctx.from.id.toString();
-  if (dailyOperationLocks.has(userId)) {
-    if (!ctx.isSilent) await ctx.reply('Otwarcie Daily Case jest już w toku.');
-    return {success:false,error:'Otwarcie jest już w toku.'};
-  }
-  dailyOperationLocks.add(userId);
+  const userId=ctx.from.id.toString();
+  let observer, attempt;
   try {
-    const session = await ensureBrowserOpen(userId,ctx);
-    if (!session?.page || !session.browser?.isConnected()) throw new Error('Brak aktywnej sesji. Użyj /login.');
-    const {page} = session;
-    let info = await daily.goToDaily(page);
-    if (info.blocked) {
-      const timeMs = daily.parseCooldown(info.time);
-      if (timeMs===null) throw new Error('Daily Case jest zablokowany, ale strona nie podała czasu odblokowania.');
-      if (!ctx.isSilent) await ctx.reply(`Daily Case jest zablokowany. Dostępny za ${formatTimeMs(timeMs)} (godz. ${daily.formatNext(Date.now()+timeMs)}).`);
+    const session=await ensureBrowserOpen(userId,ctx);
+    if(!session?.page || !session.browser?.isConnected()) throw new Error('Brak aktywnej sesji. Użyj /login.');
+    const {page}=session;
+    const user=await User.findOne({telegramId:userId});
+    attempt=user?.lastDailyAttempt;
+    let info=await daily.goToDaily(page,{refresh:true});
+    if(attempt?.status==='pending') {
+      const result=await reconcileAttempt(userId,page,attempt,info);
+      if(!ctx.isSilent) await ctx.reply(result.success?daily.formatOpened(result.reward,Date.now()+(result.newCooldownMs||300000),result.cooldownKnown):result.error);
+      return result;
+    }
+    if(info.blocked) {
+      const timeMs=daily.parseCooldown(info.time);
+      if(timeMs===null) throw new Error('Daily Case jest zablokowany, ale strona nie podała czasu odblokowania.');
+      if(!ctx.isSilent) await ctx.reply('Daily Case jest zablokowany. Dostępny za '+formatTimeMs(timeMs)+' (godz. '+daily.formatNext(Date.now()+timeMs)+').');
       return {success:false,blocked:true,timeMs};
     }
-    const before = await readInventory(page);
-    let previousReward = null;
-    try { previousReward = await daily.readLatestReward(page); }
-    catch (error) { logger.warn(`[${userId}] Historia przed otwarciem: ${error.message}`); }
-    await daily.goToDaily(page);
-    info = await daily.clickDailyButton(page);
-    if (info.blocked) {
-      const timeMs = daily.parseCooldown(info.time);
-      if (timeMs===null) throw new Error('Daily Case został zablokowany bez czasu odblokowania.');
-      return {success:false,blocked:true,timeMs};
+    let previousReward=null, before=[];
+    try {previousReward=await daily.readHistoryInTab(page);}
+    catch(error){logger.warn('['+userId+'] Historia przed otwarciem: '+error.message);}
+    try {before=await readInventory(page);}
+    catch(error){logger.warn('['+userId+'] Ekwipunek przed otwarciem: '+error.message);before=null;}
+    await page.bringToFront();
+    observer=await claim.observeClaim(page);
+    const clicked=await daily.clickDailyButton(page,async()=>{
+      if(ctx.generation!==undefined && !operations.current(userId,ctx.generation))throw new Error('AutoOpen został zatrzymany przed kliknięciem.');
+      attempt={status:'pending',phase:'click',startedAt:Date.now(),previousSignature:previousReward?.signature||null};
+      // Persist before the only opening click, including across process crashes.
+      await saveAttempt(userId,attempt);
+    });
+    if(clicked.blocked) return {success:false,blocked:true,timeMs:daily.parseCooldown(clicked.time)||300000};
+    const response=await observer.result;
+    await observer.dispose();observer=null;
+    attempt={...attempt,phase:'ack',code:response.code};
+    if(response.status==='rejected') {
+      attempt={...attempt,status:'rejected',finishedAt:Date.now()};
+      await saveAttempt(userId,attempt);
+      throw new Error('G4Skins odrzucił otwarcie Daily Case. Sprawdź komunikat strony przez /preview oraz /diagnose.');
     }
-    // Never repeat the opening click: an uncertain response may still mean it succeeded.
-    await new Promise(resolve=>setTimeout(resolve,5000));
-    let newItems = [];
+    if(response.status==='confirmed') {
+      attempt={...attempt,status:'confirmed',code:'DAILY_ACK_CONFIRMED',finishedAt:Date.now(),reward:claim.rewardText(response.reward),rewardType:response.reward.type};
+      await saveAttempt(userId,attempt);
+    } else await saveAttempt(userId,attempt);
+    // Claim acknowledgment precedes a six-second animation and a second socket
+    // request refreshing cooldown. Await the actual transition before navigation.
+    let cooldown=null;
     try {
-      const remaining = [...before];
-      const after = await readInventory(page);
-      newItems = after.filter(item=>{
-        const index = remaining.findIndex(old=>old.name===item.name);
-        if (index<0) return true;
-        remaining.splice(index,1);
-        return false;
-      });
-    } catch (error) { logger.warn(`[${userId}] Ekwipunek po otwarciu: ${error.message}`); }
-    let latestReward = null;
-    for (let attempt=0; attempt<3; attempt++) {
+      const handle=await page.waitForFunction(()=>{
+        const button=[...document.querySelectorAll('.top-options .G_Button.big')].find(el=>el.getClientRects().length);
+        const text=button?.querySelector('.button_text')?.textContent.trim();
+        return button?.disabled && !button.querySelector('.button_load') && /^\d+\s*:\s*\d{2}\s*:\s*\d{2}$/.test(text)?text:false;
+      },{timeout:30000,polling:250});
+      try {cooldown=daily.parseCooldown(await handle.jsonValue());}finally{await handle.dispose();}
+    } catch(error){logger.warn('['+userId+'] Oczekiwanie na cooldown: '+error.name);}
+    let latest=null, reward=attempt.reward||null, inventoryConfirmed=false;
+    try {
+      const row=await daily.readHistoryInTab(page);
+      if(previousReward && row?.signature!==previousReward.signature && row.type!=='empty')latest=row;
+    }catch(error){logger.warn('['+userId+'] Historia po otwarciu: '+error.message);}
+    if(latest)reward=historyReward(latest);
+    if(!reward && before) {
       try {
-        const row = await daily.readLatestReward(page);
-        if (previousReward && row.signature!==previousReward.signature && row.type!=='empty') {
-          latestReward = row;
-          break;
-        }
-      } catch (error) {
-        logger.warn(`[${userId}] Historia po otwarciu: ${error.message}`);
-        break;
-      }
-      if (attempt<2) await new Promise(resolve=>setTimeout(resolve,2500));
+        const remaining=[...before];
+        const items=(await readInventory(page)).filter(item=>{const i=remaining.findIndex(old=>old.name===item.name);if(i<0)return true;remaining.splice(i,1);return false;});
+        if(items.length){reward=items.map(item=>item.name+' ('+(item.value*4).toFixed(2)+' zł)').join('\n');inventoryConfirmed=true;}
+      }catch(error){logger.warn('['+userId+'] Ekwipunek po otwarciu: '+error.message);}
     }
-    let reward = null;
-    if (newItems.length) {
-      reward = newItems.map(item=>`${item.name} (${(item.value*4).toFixed(2)} zł)`).join('\n');
-    } else if (latestReward?.type==='exp' && latestReward.amount) {
-      reward = `${latestReward.amount} EXP`;
-    } else if (latestReward?.type==='case') {
-      reward = `skrzynka ${latestReward.name} (${latestReward.value})`;
-    } else if (latestReward?.type==='skin') {
-      reward = `${latestReward.name} (${latestReward.value})`;
+    if(response.status!=='confirmed' && !latest && !cooldown && !inventoryConfirmed) {
+      await saveAttempt(userId,{...attempt,status:'pending',phase:'confirmation',code:response.code});
+      return await pendingReply(ctx);
     }
-    let cooldown = null;
-    try {
-      const state = await daily.goToDaily(page);
-      if (state.blocked) cooldown = daily.parseCooldown(state.time);
-    } catch (error) { logger.warn(`[${userId}] Odczyt cooldownu: ${error.message}`); }
-    if (!latestReward && !newItems.length && !cooldown) throw new Error('Nie udało się potwierdzić otwarcia. Sprawdź historię Daily Case; bot ponowi tylko sprawdzenie statusu.');
-    const result = {success:true,reward,newCooldownMs:cooldown,cooldownKnown:!!cooldown};
-    if (!ctx.isSilent) {
-      await ctx.reply(daily.formatOpened(reward,Date.now()+(cooldown || 300000),!!cooldown));
-    }
-    logger.info(`[${userId}] Daily Case: ${reward || 'nagroda niepotwierdzona'}; cooldown=${cooldown}`);
+    await saveAttempt(userId,{...attempt,status:'confirmed',phase:'complete',finishedAt:Date.now(),reward,cooldownMs:cooldown});
+    const result={success:true,reward,newCooldownMs:cooldown,cooldownKnown:cooldown>0};
+    if(!ctx.isSilent)await ctx.reply(daily.formatOpened(reward,Date.now()+(cooldown||300000),result.cooldownKnown));
     return result;
-  } catch (error) {
-    const current = activeSessions.get(userId);
-    if (error.code === 'SITE_VERIFICATION' && current?.browser) await holdBrowserForVerification(userId,current.browser,current.page);
-    logger.error(`[${userId}] Otwarcie Daily Case: ${error.message}`);
-    if (!ctx.isSilent) await ctx.reply(error.message);
-    return {success:false,error:error.message};
-  } finally { dailyOperationLocks.delete(userId); }
+  }catch(error){
+    const current=activeSessions.get(userId);
+    if(error.code==='SITE_VERIFICATION' && current?.browser)await holdBrowserForVerification(userId,current.browser,current.page);
+    logger.error('['+userId+'] Otwarcie Daily Case: '+error.message);
+    // Once a click may have happened, errors cannot release the durable guard.
+    if(attempt?.status==='pending')return pendingReply(ctx);
+    if(!ctx.isSilent)await ctx.reply(error.message);
+    return {success:false,error:error.message,code:error.code};
+  }finally{if(observer)await observer.dispose();}
 }
 
+async function pendingReply(ctx) {
+  const result={success:false,pending:true,error:'Nie udało się jeszcze potwierdzić otwarcia. Bot sprawdzi wynik bez kolejnego kliknięcia. Szczegóły: /lastopen i /diagnose.'};
+  if(!ctx.isSilent)await ctx.reply(result.error);
+  return result;
+}
 
 // ====== SMART SCHEDULER & AUTOOPEN ENGINE ======
 
 /**
  * Ustawia i zapisuje precyzyjny czas następnego wywołania
  */
-function scheduleUserNext(userId, delayMs) {
+async function scheduleUserNext(userId, delayMs, generation=operations.generation(userId), reason='retry') {
+  if(!operations.current(userId,generation)) return false;
   let session = activeSessions.get(userId);
   if (!session) {
     session = { isLoggedIn: true };
@@ -1302,26 +1316,32 @@ function scheduleUserNext(userId, delayMs) {
   const nextCaseTime = Date.now() + delayMs;
   session.autoOpenEnabled = true;
   session.nextCaseTime = nextCaseTime;
+  session.scheduleReason = reason;
 
   // Uruchomienie precyzyjnego timera Node.js
   const timeout = setTimeout(async () => {
     logger.info(`⏰ [${userId}] Precyzyjny timer obudził Smart Scheduler!`);
-    await runAutoOpenCheck(userId, false);
+    await runAutoOpenCheck(userId, false).catch(error=>logger.error(`[${userId}] Timer AutoOpen: ${error.message}`));
   }, delayMs);
 
   session.autoOpenTimeout = timeout;
   setSessionAndTrack(userId, session);
 
   // Aktualizacja w MongoDB
-  User.findOneAndUpdate(
-    { telegramId: userId },
-    { autoOpenEnabled: true, nextCaseTime: nextCaseTime },
-    { upsert: true }
-  ).catch(e => logger.error(`⚠️ [${userId}] Błąd zapisu harmonogramu w bazie:`, e.message));
+  await persistSchedule(userId,{autoOpenEnabled:true,nextCaseTime,scheduleReason:reason});
 
   const minutesLeft = Math.ceil(delayMs / 60000);
   const targetDateStr = new Date(nextCaseTime).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Warsaw' });
   logger.info(`🗓️ [${userId}] AutoOpen zaplanowany za ~${minutesLeft} min (godz. ${targetDateStr})`);
+  return operations.current(userId,generation);
+}
+
+function persistSchedule(userId, values) {
+  const write=(scheduleWrites.get(userId)||Promise.resolve()).catch(()=>{}).then(()=>
+    User.findOneAndUpdate({telegramId:userId},{$set:values},{upsert:true}));
+  scheduleWrites.set(userId,write);
+  write.finally(()=>{if(scheduleWrites.get(userId)===write)scheduleWrites.delete(userId);}).catch(()=>{});
+  return write;
 }
 
 /**
@@ -1332,43 +1352,54 @@ function scheduleUserNext(userId, delayMs) {
  * 4. Jeśli dostępna: otwiera, wysyła drop, odczytuje nowy cooldown (~19h), planuje i zamyka przeglądarkę
  */
 async function runAutoOpenCheck(userId, isManual = false) {
+  if(maintenance)return;
+  return operations.run(userId,'autoopen',()=>runAutoOpenCheckLocked(userId,isManual),async()=>{
+    if(isManual)await bot.telegram.sendMessage(userId,'Inna operacja przeglądarki trwa. Poczekaj na jej zakończenie i ponów /autoopen.');
+  });
+}
+
+async function runAutoOpenCheckLocked(userId, isManual = false) {
+  const generation=operations.generation(userId);
+  if(!isManual && activeSessions.get(userId)?.autoOpenEnabled===false)return;
   if (autoOpenLocks.get(userId)) {
     if (isManual) await bot.telegram.sendMessage(userId,'Sprawdzanie AutoOpen jest już w toku. Wynik pojawi się po zakończeniu.');
     return;
   }
   autoOpenLocks.set(userId,true);
   try {
-    const silentCtx = {from:{id:parseInt(userId,10)},isSilent:true,reply:async text=>logger.info(`[${userId}] AutoOpen: ${text}`)};
+    const silentCtx = {from:{id:parseInt(userId,10)},isSilent:true,generation,reply:async text=>logger.info(`[${userId}] AutoOpen: ${text}`)};
     const checkResult = await checkDailyCase(silentCtx);
     if (!checkResult?.found) {
-      scheduleUserNext(userId,checkResult?.code === 'SITE_VERIFICATION' ? 30*60000 : 5*60000);
+      if(!await scheduleUserNext(userId,checkResult?.code === 'SITE_VERIFICATION' ? 30*60000 : 5*60000,generation))return;
       if (isManual) await bot.telegram.sendMessage(userId,
         `AutoOpen jest włączony.\n${checkResult?.error || 'Nie udało się sprawdzić statusu Daily Case.'}\n`+
         `Ponowne sprawdzenie o godz. ${daily.formatNext(activeSessions.get(userId).nextCaseTime)} (czas polski).`);
       return;
     }
-    if (checkResult.blocked) {
-      scheduleUserNext(userId,checkResult.timeMs+5000);
+    const stored=await User.findOne({telegramId:userId});
+    if (checkResult.blocked && stored?.lastDailyAttempt?.status!=='pending') {
+      if(!await scheduleUserNext(userId,checkResult.timeMs+5000,generation,'cooldown'))return;
       if (isManual) await bot.telegram.sendMessage(userId,
         `AutoOpen jest włączony. Daily Case jest obecnie zablokowany.\n`+
         `⏳ Następne automatyczne otwarcie o godz. ${daily.formatNext(activeSessions.get(userId).nextCaseTime)} (za ${checkResult.timeFormatted}, czas polski).\n`+
         'Harmonogram działa w tle. Status: /checkstatus. Zatrzymanie: /stop.');
       return;
     }
+    if(!operations.current(userId,generation))return;
     const result = await openDailyCase(silentCtx);
     if (!result?.success) {
-      scheduleUserNext(userId,result?.blocked ? result.timeMs+5000 : 5*60000);
+      if(!await scheduleUserNext(userId,result?.blocked ? result.timeMs+5000 : 5*60000,generation,result?.pending?'reconcile':result?.blocked?'cooldown':'retry'))return;
       await bot.telegram.sendMessage(userId,
         `AutoOpen jest włączony. ${result?.error || 'Daily Case nie został otwarty; status zostanie sprawdzony ponownie.'}\n`+
         `Następne sprawdzenie o godz. ${daily.formatNext(activeSessions.get(userId).nextCaseTime)} (czas polski).`);
       return;
     }
     const delay = result.newCooldownMs ? result.newCooldownMs+5000 : 5*60000;
-    scheduleUserNext(userId,delay);
+    if(!await scheduleUserNext(userId,delay,generation,result.cooldownKnown?'cooldown':'retry'))return;
     await bot.telegram.sendMessage(userId,daily.formatOpened(result.reward,activeSessions.get(userId).nextCaseTime,result.cooldownKnown));
   } catch (error) {
     logger.error(`[${userId}] AutoOpen: ${error.message}`);
-    scheduleUserNext(userId,5*60000);
+    if(!await scheduleUserNext(userId,5*60000,generation))return;
     if (isManual) await bot.telegram.sendMessage(userId,'AutoOpen jest włączony, ale sprawdzenie nie powiodło się. Ponowna próba za 5 minut.');
   } finally {
     await closeBrowserSilently(userId);
@@ -1382,11 +1413,13 @@ async function runAutoOpenCheck(userId, isManual = false) {
  */
 async function startAutoOpen(ctx) {
   const userId = ctx.from.id.toString();
+  const generation=operations.generation(userId);
 
   // Sprawdź czy użytkownik ma zapisane dane lub cookies
   const user = await loadUser(userId);
   const cookies = await loadSessionCookies(userId);
   const hasAuth = (user?.steamUsername && user?.steamPassword) || (cookies && cookies.length > 0);
+  if(!operations.current(userId,generation))return;
 
   if (!hasAuth) {
     await ctx.reply('❌ Nie jesteś zalogowany ani nie masz zapisanych danych!\nUżyj /login lub /setsteam');
@@ -1400,6 +1433,7 @@ async function startAutoOpen(ctx) {
   }
 
   await ctx.sendChatAction('typing').catch(() => {});
+  if(!operations.current(userId,generation))return;
   logger.info(`▶️ [${userId}] AutoOpen uruchomiony ręcznie komendą /autoopen`);
 
   await runAutoOpenCheck(userId, true);
@@ -1410,7 +1444,8 @@ async function startAutoOpen(ctx) {
  */
 async function stopAutoOpen(ctx) {
   const userId = ctx.from.id.toString();
-  const session = activeSessions.get(userId);
+  operations.cancel(userId);
+  const session = activeSessions.get(userId) || {};
 
   if (session?.autoOpenTimeout) {
     clearTimeout(session.autoOpenTimeout);
@@ -1423,10 +1458,7 @@ async function stopAutoOpen(ctx) {
     setSessionAndTrack(userId, session);
   }
 
-  await User.findOneAndUpdate(
-    { telegramId: userId },
-    { autoOpenEnabled: false, nextCaseTime: null }
-  ).catch(() => {});
+  await persistSchedule(userId,{autoOpenEnabled:false,nextCaseTime:null,scheduleReason:null});
 
   lastWatchdogLogTime.delete(userId);
   logger.info(`⏹️ [${userId}] AutoOpen zatrzymany`);
@@ -1448,6 +1480,7 @@ function startAutoOpenWatchdog() {
 
       for (const userDoc of activeUsers) {
         const userId = userDoc.telegramId;
+        if(activeSessions.get(userId)?.autoOpenEnabled===false)continue;
         const nextCaseTime = userDoc.nextCaseTime;
 
         if (!nextCaseTime) continue;
@@ -1458,7 +1491,7 @@ function startAutoOpenWatchdog() {
         if (remainingMs <= 0) {
           if (!autoOpenLocks.get(userId)) {
             logger.info(`⏰ [Watchdog] [${userId}] Czas nadszedł! Uruchamiam sprawdzanie/otwieranie skrzynki...`);
-            runAutoOpenCheck(userId, false);
+            runAutoOpenCheck(userId, false).catch(error=>logger.error(`[${userId}] Watchdog AutoOpen: ${error.message}`));
           }
         } else {
           // Logowanie w tle co 10 minut w konsoli
@@ -1503,7 +1536,7 @@ async function restoreAutoOpenTasks() {
       }
 
       logger.info(`🗓️ [${userId}] AutoOpen przywrócony - sprawdzenie nastąpi za ~${Math.round(delay / 60000)} min`);
-      scheduleUserNext(userId, delay);
+      await scheduleUserNext(userId, delay,operations.generation(userId),user.scheduleReason||'retry');
     }
   } catch (e) {
     logger.error('❌ Błąd podczas przywracania AutoOpen z bazy danych:', e.message);
@@ -1511,6 +1544,27 @@ async function restoreAutoOpenTasks() {
 }
 
 // ====== TELEGRAM COMMANDS ======
+
+// Serialize every command/callback that can navigate, disconnect or close the
+// user's Chromium. Scheduler owns the same gate for its complete transaction.
+const browserCommands=new Set(['check','open','verify','close','logout','reconcile','retryopen','preview']);
+bot.use(async(ctx,next)=>{
+  const command=ctx.message?.text?.match(/^\/(\w+)(?:@\w+)?(?:\s|$)/)?.[1]?.toLowerCase();
+  if(!browserCommands.has(command) && !/^login_(qr|password)$/.test(ctx.callbackQuery?.data||''))return next();
+  if(maintenance)return ctx.reply('Trwa administracyjny reset sesji. Spróbuj ponownie po jego zakończeniu.');
+  const userId=String(ctx.from.id);
+  return operations.run(userId,command||'login',next,async name=>{
+    if(ctx.callbackQuery)await ctx.answerCbQuery().catch(()=>{});
+    await ctx.reply(`Trwa operacja: ${name}. Poczekaj na jej zakończenie. Status bez zmiany strony: /diagnose.`);
+  });
+});
+
+const registeredCommands=new Set();
+const registerCommand=bot.command.bind(bot);
+bot.command=(name,...handlers)=>{
+  if(registeredCommands.has(name))throw new Error('Duplicate Telegram command: '+name);
+  registeredCommands.add(name);return registerCommand(name,...handlers);
+};
 
 const commands = [
   { command: '/start', description: 'Wszystkie komendy' },
@@ -1522,6 +1576,11 @@ const commands = [
   { command: '/open', description: 'Otwórz daily case' },
   { command: '/stop', description: 'Zatrzymaj Smart Scheduler' },
   { command: '/close', description: 'Zamknij okno przeglądarki' },
+  { command: '/diagnose', description: 'Diagnostyka bez zmiany strony' },
+  { command: '/lastopen', description: 'Wynik i etap ostatniego otwarcia' },
+  { command: '/reconcile', description: 'Sprawdź wynik bez kolejnego kliknięcia' },
+  { command: '/retryopen', description: 'Odblokuj próbę po sprawdzeniu historii' },
+  { command: '/preview', description: 'Podgląd przeglądarki na 30 minut' },
 ];
 
 bot.command('start', (ctx) => {
@@ -1542,6 +1601,11 @@ bot.command('start', (ctx) => {
     '/close - Zamknij przeglądarkę (oszczędność RAM)\n' +
     '/dbtest - Sprawdź status bazy danych\n' +
     '/status - Sprawdź status sesji\n\n' +
+    '/diagnose - Diagnostyka bez zmiany strony\n' +
+    '/lastopen - Etap i wynik ostatniej próby\n' +
+    '/reconcile - Uzgodnij wynik z historią bez otwierania\n' +
+    '/retryopen - Odblokuj niepewną próbę po sprawdzeniu historii\n' +
+    '/preview [off] - Podgląd przeglądarki na 30 minut\n\n' +
     '💡 Smart Scheduler (AutoOpen):\n' +
     '• Precyzyjnie odlicza czas do następnej skrzynki\n' +
     '• Zamyka przeglądarkę w tle, oszczędzając pamięć RAM\n' +
@@ -1568,7 +1632,7 @@ bot.command('dbtest', async (ctx) => {
       userInfo = `
 📝 Username: ${user.steamUsername || 'BRAK'}
 🔐 Password: ${user.steamPassword ? '***' : 'BRAK'}
-🔢 PIN: ${user.familyViewPin || 'BRAK'}
+🔢 PIN: ${user.familyViewPin ? 'ZAPISANY' : 'BRAK'}
 🔄 AutoOpen w bazie: ${user.autoOpenEnabled ? 'Tak' : 'Nie'}
 ⏰ NextCaseTime: ${user.nextCaseTime ? new Date(user.nextCaseTime).toLocaleString('pl-PL') : 'Brak'}
       `.trim();
@@ -1589,7 +1653,7 @@ bot.command('checkstatus', async (ctx) => {
   const session = activeSessions.get(userId);
   const user = await loadUser(userId);
 
-  const isAutoOpen = session?.autoOpenEnabled || user?.autoOpenEnabled;
+  const isAutoOpen = session?.autoOpenEnabled ?? user?.autoOpenEnabled;
   const nextTime = session?.nextCaseTime || user?.nextCaseTime;
 
   if (!isAutoOpen) {
@@ -1608,8 +1672,9 @@ bot.command('checkstatus', async (ctx) => {
     const minutesLeft = Math.ceil(remainingMs / 60000);
     const targetDate = new Date(nextTime).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Warsaw' });
 
-    statusText += `\n⏰ Czas do skrzynki: ${timeFormatted} (~${minutesLeft} min)\n`;
-    statusText += `Planowane automatyczne otwarcie (czas polski): godz. ${targetDate}`;
+    const reason=session?.scheduleReason||user?.scheduleReason;
+    statusText += `\n⏰ Do następnego ${reason==='cooldown'?'otwarcia':'sprawdzenia'}: ${timeFormatted} (~${minutesLeft} min)\n`;
+    statusText += `${reason==='cooldown'?'Planowane automatyczne otwarcie':'Ponowne sprawdzenie statusu'} (czas polski): godz. ${targetDate}`;
   } else {
     statusText += '\n⏰ Status: Gotowy do otwarcia!';
   }
@@ -1638,11 +1703,11 @@ bot.hears(/^PIN:(\d{4})$/, async (ctx) => {
   await saveUser(user);
 
   ctx.deleteMessage().catch(() => {});
-  logger.info(`🔐 [${userId}] Family View PIN zapisany: ${pin}`);
+  logger.info(`🔐 [${userId}] Family View PIN zapisany`);
   ctx.reply('✅ PIN Family View zapisany bezpiecznie!');
 });
 
-bot.hears(/^([^:]+):(.+)$/, async (ctx) => {
+bot.hears(/^(?!\/|PIN:)([^:]+):(.+)$/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const match = ctx.message.text.match(/^([^:]+):(.+)$/);
   const username = match[1].trim();
@@ -1735,6 +1800,63 @@ bot.command('open', openDailyCase);
 bot.command('autoopen', startAutoOpen);
 bot.command('stop', stopAutoOpen);
 
+bot.command('setsteam',ctx=>ctx.reply('Wyślij login i hasło Steam w formacie login:hasło. Wiadomość zostanie usunięta po zapisaniu danych.'));
+
+bot.command('lastopen',async ctx=>{
+  const attempt=(await loadUser(String(ctx.from.id)))?.lastDailyAttempt;
+  if(!attempt)return ctx.reply('Brak zapisanej próby otwarcia w nowej wersji bota.');
+  const date=time=>new Date(time).toLocaleString('pl-PL',{timeZone:'Europe/Warsaw'});
+  await ctx.reply(`Ostatnia próba Daily Case\nStan: ${attempt.status}\nEtap: ${attempt.phase}\nRozpoczęcie: ${date(attempt.startedAt)}\n`+
+    `${attempt.finishedAt?'Zakończenie: '+date(attempt.finishedAt)+'\n':''}`+
+    `Wynik: ${attempt.reward||'nagroda niepotwierdzona'}\nKod diagnostyczny: ${attempt.code||'brak'}`);
+});
+
+bot.command('diagnose',async ctx=>{
+  const userId=String(ctx.from.id),session=activeSessions.get(userId),user=await loadUser(userId);
+  let route='brak',state=null;
+  if(session?.page && !session.page.isClosed()) {
+    try {route=new URL(session.page.url()).pathname;state=await session.page.evaluate(daily.dailyButtonState);}catch{}
+  }
+  await ctx.reply(`Diagnostyka bota\nMongoDB: ${mongoose.connection.readyState===1?'połączono':'brak połączenia'}\n`+
+    `Operacja: ${operations.busy(userId)||'bezczynny'}\nPrzeglądarka: ${session?.browser?.isConnected()?'połączona':'uśpiona/odłączona'}\n`+
+    `Ścieżka strony: ${route}\nPrzycisk: ${state?(state.loading?'przetwarzanie':state.blocked?'zablokowany':state.actionable?'dostępny':'wymagane logowanie/warunki'):'brak gotowego przycisku'}\n`+
+    `Podgląd: ${session?.previewUntil>Date.now()?'włączony':'wyłączony'}\n`+
+    `AutoOpen: ${(session?.autoOpenEnabled??user?.autoOpenEnabled)?'włączony':'wyłączony'}\n`+
+    `Rodzaj terminu: ${session?.scheduleReason||user?.scheduleReason||'brak'}\n`+
+    `Ostatnia próba: ${user?.lastDailyAttempt?.status||'brak'} / ${user?.lastDailyAttempt?.code||'brak kodu'}`);
+});
+
+bot.command('reconcile',async ctx=>{
+  const userId=String(ctx.from.id),attempt=(await User.findOne({telegramId:userId}))?.lastDailyAttempt;
+  if(attempt?.status!=='pending')return ctx.reply('Brak niepotwierdzonej próby. Ostatni wynik: /lastopen.');
+  const session=await ensureBrowserOpen(userId,ctx);
+  if(!session?.page)return ctx.reply('Brak aktywnej sesji. Użyj /login.');
+  const info=await daily.goToDaily(session.page,{refresh:true});
+  const result=await reconcileAttempt(userId,session.page,attempt,info);
+  await ctx.reply(result.success?daily.formatOpened(result.reward,Date.now()+(result.newCooldownMs||300000),result.cooldownKnown):result.error);
+});
+
+bot.command('retryopen',async ctx=>{
+  const userId=String(ctx.from.id),attempt=(await User.findOne({telegramId:userId}))?.lastDailyAttempt;
+  if(attempt?.status!=='pending')return ctx.reply('Brak niepotwierdzonej próby do odblokowania. Użyj /check.');
+  if(!/\s+potwierdzam\s*$/i.test(ctx.message.text))return ctx.reply('Najpierw sprawdź historię Daily Case na stronie lub użyj /reconcile. Jeśli ostatnia próba nie otworzyła skrzynki, wyślij /retryopen potwierdzam. Polecenie odblokuje kolejną próbę bez klikania przycisku.');
+  await saveAttempt(userId,{...attempt,status:'released',phase:'user-released',finishedAt:Date.now()});
+  await ctx.reply('Odblokowano kolejną próbę. Użyj /open lub /autoopen.');
+});
+
+bot.command('preview',async ctx=>{
+  const userId=String(ctx.from.id);
+  if(/\s+off\s*$/i.test(ctx.message.text)) {
+    const session=activeSessions.get(userId);if(session)session.previewUntil=0;
+    return ctx.reply('Podgląd wyłączony. Przeglądarka może ponownie usypiać po zadaniu.');
+  }
+  const session=await ensureBrowserOpen(userId,ctx);
+  if(!session?.page)return ctx.reply('Brak sesji przeglądarki. Użyj /login.');
+  session.previewUntil=Date.now()+30*60000;
+  await session.page.bringToFront();
+  await ctx.reply('Podgląd włączony na 30 minut. Okno pozostanie otwarte po /autoopen.\nPanel przez tunel SSH: http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale\nWyłączenie: /preview off.');
+});
+
 bot.command('close', async (ctx) => {
   const userId = ctx.from.id.toString();
   await browserSession.closeNative(userId);
@@ -1759,6 +1881,9 @@ bot.command('close', async (ctx) => {
 
 bot.command('logout', async (ctx) => {
   const userId = ctx.from.id.toString();
+  operations.cancel(userId);
+  await persistSchedule(userId,{autoOpenEnabled:false,nextCaseTime:null,scheduleReason:null});
+  await Session.deleteOne({telegramId:userId});
   await browserSession.closeNative(userId, true);
   const session = activeSessions.get(userId);
 
@@ -1792,11 +1917,17 @@ bot.command('logout', async (ctx) => {
 });
 
 bot.command('resetall', async (ctx) => {
+  const admins=(process.env.BOT_ADMIN_IDS||process.env.TELEGRAM_CHAT_ID||'').split(',').map(x=>x.trim()).filter(x=>/^\d+$/.test(x));
+  if(!admins.includes(String(ctx.from.id)))return ctx.reply('Polecenie dostępne wyłącznie dla administratora bota.');
+  if(maintenance || operations.active.size)return ctx.reply('Trwa operacja przeglądarki. Reset można wykonać po jej zakończeniu.');
+  maintenance=true;
+  try {
   await browserSession.closeAll(true);
   logger.info('🔄 [RESETALL] Rozpoczynam reset wszystkich sesji...');
 
   let closedCount = 0;
   for (const [userId, session] of activeSessions.entries()) {
+    operations.cancel(userId);
     try {
       if (session.autoOpenTimeout) {
         clearTimeout(session.autoOpenTimeout);
@@ -1826,6 +1957,7 @@ bot.command('resetall', async (ctx) => {
 
   await ctx.reply(`🔄 Reset zakończony!\nZamknięto ${closedCount} aktywnych sesji.\nWszystkie dane wyczyszczone.`);
   logger.info(`✅ [RESETALL] Reset zakończony - zamknięto ${closedCount} sesji`);
+  }finally{maintenance=false;}
 });
 
 bot.command('status', async (ctx) => {
@@ -1839,7 +1971,7 @@ bot.command('status', async (ctx) => {
   }
 
   const browserStatus = session?.browser && session.browser.isConnected() ? '✅ Aktywna' : '💤 Uśpiona w tle';
-  const isAutoOpen = session?.autoOpenEnabled || user?.autoOpenEnabled;
+  const isAutoOpen = session?.autoOpenEnabled ?? user?.autoOpenEnabled;
   const nextTime = session?.nextCaseTime || user?.nextCaseTime;
 
   let autoOpenStr = '❌ Wyłączony';
@@ -1847,7 +1979,7 @@ bot.command('status', async (ctx) => {
     if (nextTime && nextTime > Date.now()) {
       const mins = Math.ceil((nextTime - Date.now()) / 60000);
       const targetTimeStr = new Date(nextTime).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Warsaw' });
-      autoOpenStr = `✅ Włączony (otwarcie o ${targetTimeStr}, za ~${mins} min)`;
+      autoOpenStr = `✅ Włączony (${(session?.scheduleReason||user?.scheduleReason)==='cooldown'?'otwarcie':'sprawdzenie'} o ${targetTimeStr}, za ~${mins} min)`;
     } else {
       autoOpenStr = '✅ Włączony (oczekiwanie na sprawdzenie)';
     }
@@ -1876,7 +2008,7 @@ async function startBot() {
     process.exit(1);
   }
 
-  await bot.telegram.setMyCommands(commands).catch(() => {});
+  await bot.telegram.setMyCommands(commands.map(({command,...entry})=>({...entry,command:command.replace(/^\//,'')}))).catch(error=>logger.warn('Nie udało się ustawić menu Telegram: '+error.message));
   await bot.telegram.setChatMenuButton({
     menu_button: {
       type: 'commands',
@@ -1903,9 +2035,9 @@ async function startBot() {
         bot,
         activeSessions,
         loadUser,
-        loginToSteam,
-        checkDailyCase,
-        openDailyCase
+        (ctx,method)=>operations.run(String(ctx.from.id),'login',()=>loginToSteam(ctx,method),()=>ctx.reply('Trwa inna operacja.')),
+        ctx=>operations.run(String(ctx.from.id),'check',()=>checkDailyCase(ctx),()=>ctx.reply('Trwa inna operacja.')),
+        ctx=>operations.run(String(ctx.from.id),'open',()=>openDailyCase(ctx),()=>ctx.reply('Trwa inna operacja.'))
       );
 
       setTimeout(() => {
@@ -1918,6 +2050,11 @@ async function startBot() {
     process.exit(1);
   }
 }
+
+bot.catch(async(error,ctx)=>{
+  logger.error(`[${ctx.from?.id||'?'}] Błąd obsługi polecenia: ${error.message}`);
+  await ctx.reply('Operacja nie powiodła się. Użyj /diagnose i sprawdź logi serwera.').catch(()=>{});
+});
 
 startBot();
 

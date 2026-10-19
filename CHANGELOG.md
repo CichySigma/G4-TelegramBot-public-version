@@ -1,5 +1,15 @@
 # Changelog - Naprawiony Błąd i Nowe Funkcje
 
+## 2026-10-19 — potwierdzanie otwarcia Daily Case
+
+- Oczekiwanie na gotowość Vue i obsługę kliknięcia; odróżnienie logowania, wymagań i animacji od dostępnego otwarcia.
+- Pasywne potwierdzenie odpowiedzi Socket.IO na pojedyncze kliknięcie, oczekiwanie na licznik oraz historia w osobnej karcie.
+- Zapis niepotwierdzonej próby przed kliknięciem, także na wypadek restartu.
+- Wspólna blokada operacji przeglądarki; `/stop` unieważnia trwający cykl i zapobiega ponownemu włączeniu harmonogramu.
+- Komendy `/diagnose`, `/lastopen`, `/reconcile`, `/retryopen` i `/preview`; poprawione menu oraz opis czasu ponownego sprawdzenia.
+- Ograniczenie `/resetall` do administratora, maskowanie PIN-u oraz zapis danych logowania bez nadpisywania harmonogramu.
+- Testy z opóźnioną odpowiedzią WebSocket w Chromium i regresje współbieżności.
+
 ## Data: 2026-09-19
 
 ### 🐛 Naprawione Błędy
